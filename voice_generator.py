@@ -125,7 +125,7 @@ class VoiceGenerator(QThread):
             if previous_end_time is not None:
                 gap = segment['start_time'] - previous_end_time
                 if gap > 0:
-                    words = int(gap * 2)  # Calculate words based on gap
+                    words = int(gap * 3)  # Calculate words based on gap
                     
                     # Only add commentary request if within word limits
                     if 8 <= words <= 180:
