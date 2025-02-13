@@ -3,6 +3,8 @@ from tkinter import filedialog, messagebox
 import time
 import os
 import sys
+import pygame  # For audio playback
+
 
 ##########################
 # Parsing / Utility
@@ -11,7 +13,8 @@ import sys
 def parse_time_to_seconds(timestr):
     """Parse HH:MM:SS into integer seconds."""
     h, m, s = timestr.split(':')
-    return int(h)*3600 + int(m)*60 + int(s)
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
 
 def parse_event_line(line):
     """Parse a line 'HH:MM:SS - Description' into (seconds, description)."""
@@ -24,6 +27,7 @@ def parse_event_line(line):
     time_str, description = parts
     return (parse_time_to_seconds(time_str), description)
 
+
 def load_events_from_file(filename):
     """Read each line, parse into (seconds, description), sort by time."""
     events = []
@@ -35,6 +39,7 @@ def load_events_from_file(filename):
     events.sort(key=lambda e: e[0])
     return events
 
+
 def beep(different=False):
     """
     Produce a beep. If on Windows, you can use winsound.Beep().
@@ -44,6 +49,7 @@ def beep(different=False):
         print("!!! BEEP (Different) !!!\a")
     else:
         print("Beep!\a")
+
 
 ##########################
 # Tkinter GUI
@@ -58,28 +64,44 @@ class RaceTimerApp:
         # Force the window to be on top
         self.root.attributes("-topmost", True)
 
-        self.events = []          # List of (second, description)
-        self.current_time = 0     # How many seconds since race start
-        self.paused = True        # Start paused (or in "not started" mode)
+        self.events = []  # List of (second, description)
+        self.current_time = 0  # Seconds since race start
+        self.paused = True  # Start paused (or in "not started" mode)
         self.countdown_active = False
         self.countdown_time = 10
+        self.audio_loaded = False
+
+        # Initialize pygame mixer for audio playback
+        pygame.mixer.init()
 
         # UI Elements
         self.create_widgets()
 
     def create_widgets(self):
-        # Frame for file loading
+        # Frame for file loading (Events and Audio)
         file_frame = tk.Frame(self.root)
         file_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
 
         btn_load = tk.Button(file_frame, text="Load Events File", command=self.load_file)
         btn_load.pack(side=tk.LEFT, padx=5)
 
+        btn_load_audio = tk.Button(file_frame, text="Load Audio File", command=self.load_audio_file)
+        btn_load_audio.pack(side=tk.LEFT, padx=5)
+
+        # Frame for setting time manually
+        time_set_frame = tk.Frame(self.root)
+        time_set_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
+        tk.Label(time_set_frame, text="Set Time (HH:MM:SS):").pack(side=tk.LEFT, padx=5)
+        self.time_entry = tk.Entry(time_set_frame, width=10)
+        self.time_entry.pack(side=tk.LEFT, padx=5)
+        btn_set_time = tk.Button(time_set_frame, text="Set Time", command=self.set_time)
+        btn_set_time.pack(side=tk.LEFT, padx=5)
+
         # Countdown / Timer Label
         self.countdown_label = tk.Label(self.root, text="", font=("Arial", 14), fg="red")
         self.countdown_label.pack(pady=5)
 
-        self.timer_label = tk.Label(self.root, text="Current Time: 0 s", font=("Arial", 14, "bold"))
+        self.timer_label = tk.Label(self.root, text="Current Time: 00:00:00", font=("Arial", 14, "bold"))
         self.timer_label.pack(pady=5)
 
         # Control buttons
@@ -89,7 +111,7 @@ class RaceTimerApp:
         self.btn_start = tk.Button(controls_frame, text="Start Countdown", command=self.start_countdown)
         self.btn_start.pack(side=tk.LEFT, padx=2)
 
-        self.btn_pause = tk.Button(controls_frame, text="Pause/Unpause", command=self.toggle_pause, state=tk.DISABLED)
+        self.btn_pause = tk.Button(controls_frame, text="Pause/Resume", command=self.toggle_pause, state=tk.DISABLED)
         self.btn_pause.pack(side=tk.LEFT, padx=2)
 
         self.btn_rewind = tk.Button(controls_frame, text="Rewind 10s", command=self.rewind_10s, state=tk.DISABLED)
@@ -107,7 +129,7 @@ class RaceTimerApp:
 
     def load_file(self):
         """Open a file dialog to load events."""
-        filename = filedialog.askopenfilename(title="Select events file", 
+        filename = filedialog.askopenfilename(title="Select events file",
                                               filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
         if not filename:
             return  # user canceled
@@ -118,10 +140,51 @@ class RaceTimerApp:
             self.btn_start.config(state=tk.NORMAL)
             self.current_time = 0
             self.paused = True
-            self.timer_label.config(text=f"Current Time: {self.current_time} s")
+            self.timer_label.config(text=f"Current Time: {self.seconds_to_hms(self.current_time)}")
             self.update_events_text()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file:\n{e}")
+
+    def load_audio_file(self):
+        """Open a file dialog to load an audio file."""
+        filename = filedialog.askopenfilename(title="Select Audio File",
+                                              filetypes=[("Audio Files", "*.mp3;*.wav;*.ogg"), ("All Files", "*.*")])
+        if not filename:
+            return  # user canceled
+        try:
+            pygame.mixer.music.load(filename)
+            self.audio_loaded = True
+            messagebox.showinfo("Audio Loaded", f"Loaded audio file:\n{os.path.basename(filename)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load audio file:\n{e}")
+
+    def set_time(self):
+        """Set the current time to a specific value provided by the user (HH:MM:SS)."""
+        timestr = self.time_entry.get().strip()
+        if not timestr:
+            messagebox.showwarning("Invalid Input", "Please enter a time in HH:MM:SS format.")
+            return
+        try:
+            new_time = parse_time_to_seconds(timestr)
+            self.current_time = new_time
+            self.timer_label.config(text=f"Current Time: {self.seconds_to_hms(self.current_time)}")
+            self.update_events_text()
+            # Adjust audio position if audio is loaded
+            if self.audio_loaded:
+                pygame.mixer.music.stop()
+                # Only restart audio immediately if not paused; otherwise, let the resume logic handle it.
+                if not self.paused:
+                    pygame.mixer.music.play(loops=0, start=self.current_time)
+            messagebox.showinfo("Time Set", f"Time set to {self.seconds_to_hms(self.current_time)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid time format:\n{e}")
+
+    def seconds_to_hms(self, seconds):
+        """Convert seconds to HH:MM:SS format."""
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
     def start_countdown(self):
         """Start the 10-second countdown before the race."""
@@ -129,7 +192,7 @@ class RaceTimerApp:
             messagebox.showwarning("No Events", "Please load an events file first.")
             return
 
-        # Disable start button while countdown is active
+        # Disable buttons while countdown is active
         self.btn_start.config(state=tk.DISABLED)
         self.btn_pause.config(state=tk.DISABLED)
         self.btn_rewind.config(state=tk.DISABLED)
@@ -150,13 +213,13 @@ class RaceTimerApp:
             # beep logic at 5s and each second from 5..1
             if self.countdown_time <= 5:
                 beep()  # beep
-            self.countdown_label.config(text=f"Countdown: {self.countdown_time}...")
+            self.countdown_label.config(text=f"Countdown: {self.countdown_time}...", fg="red")
             self.countdown_time -= 1
             self.root.after(1000, self.update_countdown_label)
         else:
-            # Final beep
+            # Final beep and start the race
             beep(different=True)
-            self.countdown_label.config(text="Countdown: 0. GO!")
+            self.countdown_label.config(text="Countdown: 0. GO!", fg="red")
             self.countdown_active = False
             self.paused = False
             # Enable race controls
@@ -164,35 +227,35 @@ class RaceTimerApp:
             self.btn_rewind.config(state=tk.NORMAL)
             self.btn_ffwd.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.NORMAL)
+            # Start audio playback if loaded
+            if self.audio_loaded:
+                pygame.mixer.music.play(loops=0, start=self.current_time)
             # Clear the label after a short delay
             self.root.after(1000, lambda: self.countdown_label.config(text=""))
-
             # Start race time updates
             self.update_race_time()
 
     def update_race_time(self):
         """Update the race timer every second (if not paused)."""
-        # If the race has been 'stopped', don't continue
         if self.stopped:
             return
 
         if not self.paused:
             self.current_time += 1
 
-        self.timer_label.config(text=f"Current Time: {self.current_time} s")
+        self.timer_label.config(text=f"Current Time: {self.seconds_to_hms(self.current_time)}")
         self.update_events_text()
 
-        # Schedule the next update in 1 second
         self.root.after(1000, self.update_race_time)
 
     def update_events_text(self):
         """
-        Display the past 10s of events and next 20s of events in the text box.
-        Instead of actual HH:MM:SS, show how many seconds ago or in the future.
+        Display the past 10s of events and the next 2 minutes of events in the text box.
+        Instead of showing HH:MM:SS, we show how many seconds ago or in the future.
         """
         text_lines = []
         past_window_start = self.current_time - 10
-        future_window_end = self.current_time + 20
+        future_window_end = self.current_time + 120  # next 2 minutes
 
         past_events = []
         future_events = []
@@ -205,7 +268,6 @@ class RaceTimerApp:
                 seconds_future = ev_time - self.current_time
                 future_events.append((seconds_future, ev_desc))
 
-        # Sort ascending
         past_events.sort(key=lambda x: x[0])
         future_events.sort(key=lambda x: x[0])
 
@@ -213,44 +275,72 @@ class RaceTimerApp:
         for (sec_ago, desc) in past_events:
             text_lines.append(f"{sec_ago} seconds ago: {desc}")
 
-        text_lines.append("---- Next 20 seconds ----")
+        text_lines.append("---- Next 2 minutes ----")
         for (sec_future, desc) in future_events:
             text_lines.append(f"In {sec_future} seconds: {desc}")
 
-        # Update the text box
         self.events_text.delete("1.0", tk.END)
         self.events_text.insert(tk.END, "\n".join(text_lines))
 
     def toggle_pause(self):
-        """Pause / Unpause the race."""
-        self.paused = not self.paused
-        if self.paused:
+        """Pause or resume the race with a 5-second countdown on resume."""
+        if not self.paused:
+            # Currently running, so pause
+            self.paused = True
+            if self.audio_loaded:
+                pygame.mixer.music.pause()
             self.countdown_label.config(text="=== PAUSED ===", fg="blue")
         else:
+            # Currently paused, so resume with a 5-second countdown
+            self.start_resume_countdown()
+
+    def start_resume_countdown(self):
+        self.resume_countdown_time = 5
+        self.update_resume_countdown_label()
+
+    def update_resume_countdown_label(self):
+        if self.resume_countdown_time > 0:
+            self.countdown_label.config(text=f"Resuming in {self.resume_countdown_time}...", fg="green")
+            self.resume_countdown_time -= 1
+            self.root.after(1000, self.update_resume_countdown_label)
+        else:
             self.countdown_label.config(text="")
-        # No need to do anything else, the update_race_time will handle it.
+            self.paused = False
+            if self.audio_loaded:
+                # Restart the audio at the current time to keep it in sync.
+                pygame.mixer.music.stop()
+                pygame.mixer.music.play(loops=0, start=self.current_time)
 
     def rewind_10s(self):
         """Rewind the current race time by 10 seconds (min 0)."""
         self.current_time = max(0, self.current_time - 10)
+        self.timer_label.config(text=f"Current Time: {self.seconds_to_hms(self.current_time)}")
         self.update_events_text()
+        if self.audio_loaded and not self.paused:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.play(loops=0, start=self.current_time)
 
     def ffwd_10s(self):
         """Fast-forward the current race time by 10 seconds."""
         self.current_time += 10
+        self.timer_label.config(text=f"Current Time: {self.seconds_to_hms(self.current_time)}")
         self.update_events_text()
+        if self.audio_loaded and not self.paused:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.play(loops=0, start=self.current_time)
 
     def stop_race(self):
         """Stop the race completely."""
         self.paused = True
         self.stopped = True
         self.countdown_label.config(text="=== STOPPED ===", fg="red")
-        # Disable control buttons
         self.btn_pause.config(state=tk.DISABLED)
         self.btn_rewind.config(state=tk.DISABLED)
         self.btn_ffwd.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.DISABLED)
-    
+        if self.audio_loaded:
+            pygame.mixer.music.stop()
+
     @property
     def stopped(self):
         return getattr(self, "_stopped", False)
@@ -263,10 +353,9 @@ class RaceTimerApp:
 def main():
     root = tk.Tk()
     app = RaceTimerApp(root)
-    # Initially, race is "stopped" (or not started), so we set:
     app.stopped = False
-
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
