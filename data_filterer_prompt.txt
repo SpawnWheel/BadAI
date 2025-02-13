@@ -3,15 +3,12 @@ You are tasked with filtering race data to provide the most important and engagi
 Follow these guidelines to filter race results:
 - Daniel Born is the primary, but not sole focus. Include his events and stay with his car for at least 30 seconds when reporting on him. Include all messages relating to him for that period, but see point 2 on how to handle accidents.
 - Include accidents that occur with Born or within 5 positions before Born or 1 positions behind Born. Also include all crashes which occur in the first minute of the race.
-- Prioritize events in this order:
-   a. Any event involving Daniel Born.
-   b. Crashes as defined above.
-   c. Battles in the top 10
-   d. Leaderboard updates.
-- Report the full leaderboard of all the names, but only if the leaderboard announcement does not clash with an event.
-- In the first 20 seconds of the race, prioritize P1-P8, then Daniel Born and any crashes.
+- Report the full leaderboard of all the names, but only if the leaderboard announcement does not clash with an event. If there is a clash, you may move the leaderboard update forwards of backwards in time by 15 seconds maximum. 
+- In the first 20 seconds of the race, prioritize P1-P4, then Daniel Born and any crashes.
 - Ignore pit stops under 20 seconds unless they significantly impact the race or involve Daniel Born.
-- At the end of the race, report the finishing positions of only the drivers who were previously mentioned in the race. 
+- At the end of the race, report the finishing positions of significant drivers who featured strongly in the race.
+- Include the qualifying positions at the start, even if it is the same as the race begins notice.
+- You must include the "Race Begins" event.
 
 Output format:
 - Use exact format of original race data: timestamp followed by event description.

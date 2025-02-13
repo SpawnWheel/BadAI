@@ -9,6 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from accapi.client import AccClient
 
+
 class DataCollector(QThread):
     output_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
@@ -17,7 +18,7 @@ class DataCollector(QThread):
         super().__init__()
         self.client = AccClient()
         self.running = False
-        self.cars = {}               # Holds info about each car
+        self.cars = {}  # Holds info about each car
         self.session_info = {}
         self.last_update_time = 0
         self.update_interval = 4
@@ -31,6 +32,8 @@ class DataCollector(QThread):
         self.output_file = None
         self.cars_in_pits = set()
         self.last_position_display = 0
+        self.track_data = None
+        self.weather_data = None
 
         # Final lap & finishing logic
         self.final_lap_phase = False
@@ -49,13 +52,7 @@ class DataCollector(QThread):
         self.track_name = "Unknown"
         self.corner_data = []  # Store corner data for the current track
 
-        # NEW: Per‐car data for custom lap detection with a "just_crossed_line" flag
-        # key = carIndex, value = {
-        #   'lap_count': int,
-        #   'last_spline': float or None,
-        #   'skip_first_crossing': bool,
-        #   'just_crossed_line': bool
-        # }
+        # Per‐car data for custom lap detection with a "just_crossed_line" flag
         self.custom_laps = {}
 
         # Thresholds for detecting a crossing
@@ -63,19 +60,42 @@ class DataCollector(QThread):
         self.LOWER_THRESHOLD = 0.1
 
     def run(self):
+        """Main execution loop for data collection."""
         self.running = True
         self.setup_client()
         self.start_client()
 
         self.output_signal.emit("Initializing data collection...")
 
-        # Wait until initialization is complete, track name is available, and cars data is populated
-        while not (self.initialization_complete and self.track_name != "Unknown" and self.cars) and self.running:
-            self.msleep(500)
+        # Give the client some time to connect and receive initial data
+        initialization_attempts = 0
+        max_attempts = 20  # 10 seconds total (20 * 500ms)
 
-        if self.initialization_complete:
+        while initialization_attempts < max_attempts and self.running:
+            if self.track_name != "Unknown" and self.cars:
+                self.initialization_complete = True
+                break
+            self.msleep(500)
+            initialization_attempts += 1
+
+        if not self.initialization_complete:
+            self.output_signal.emit("Warning: Could not fully initialize, but continuing with limited data...")
+            self.initialization_complete = True  # Continue anyway
+
+        if self.running:
             self.setup_output_file()
-            self.output_signal.emit(f"Data collection initialized for track: {self.track_name}. Starting race monitoring...")
+
+            # Attempt to log pre-race information
+            pre_race_logged = False
+            pre_race_attempts = 0
+            while not pre_race_logged and pre_race_attempts < 5 and self.running:
+                pre_race_logged = self.log_pre_race_info()
+                if not pre_race_logged:
+                    self.msleep(1000)
+                    pre_race_attempts += 1
+
+            self.output_signal.emit(
+                f"Data collection initialized for track: {self.track_name}. Starting race monitoring...")
 
             # Load corner data for the track
             self.load_corner_data()
@@ -89,7 +109,50 @@ class DataCollector(QThread):
                 self.update_race_data()
 
         # Save spline data to a JSON file when the race ends
-        self.save_spline_data()
+        if hasattr(self, 'spline_data'):
+            self.save_spline_data()
+
+    def log_pre_race_info(self):
+        """Logs comprehensive pre-race information including track, weather, and session details."""
+        try:
+            # Basic race information
+            pre_race_info = []
+
+            # Track Information - only add if we have a valid track name
+            if self.track_name and self.track_name != "Unknown":
+                pre_race_info.append(f"Track: {self.track_name}")
+
+            # Session Information - check if dictionary exists and has required keys
+            if self.session_info and isinstance(self.session_info, dict):
+                if 'sessionType' in self.session_info:
+                    pre_race_info.append(f"Session Type: {self.session_info['sessionType']}")
+
+            # Car Classes - safely handle potentially empty cars dictionary
+            if self.cars:
+                car_classes = set()
+                for car in self.cars.values():
+                    if isinstance(car, dict):  # Ensure car is a dictionary
+                        if car.get('isActive', False) and 'carClass' in car:
+                            car_classes.add(car['carClass'])
+
+                if car_classes:
+                    pre_race_info.append(f"Car Classes: {', '.join(sorted(car_classes))}")
+
+            # Only proceed if we have enough information
+            if len(pre_race_info) > 0:
+                # Join all information with separators
+                info_string = " | ".join(pre_race_info)
+
+                # Log the pre-race information
+                self.log_event(f"Pre-Race Information: {info_string}")
+                return True
+            else:
+                self.output_signal.emit("Waiting for more race information...")
+                return False
+
+        except Exception as e:
+            self.output_signal.emit(f"Error collecting pre-race information: {str(e)}")
+            return False
 
     def stop(self):
         self.running = False
@@ -160,6 +223,7 @@ class DataCollector(QThread):
     def on_track_data_update(self, event):
         track_data = event.content
         self.track_name = track_data.trackName
+        self.track_data = track_data
         # Load corner data after receiving track name
         self.load_corner_data()
 
@@ -178,11 +242,11 @@ class DataCollector(QThread):
 
     def on_realtime_car_update(self, event):
         car = event.content
-        
+
         # Initialize the dictionary for this car if needed
         if car.carIndex not in self.cars:
             self.cars[car.carIndex] = {
-                'carIndex': car.carIndex, 
+                'carIndex': car.carIndex,
                 'previous_spline': 0,
                 'laps': 0
             }
@@ -283,8 +347,8 @@ class DataCollector(QThread):
         car = event.content
         if car.carIndex not in self.cars:
             self.cars[car.carIndex] = {
-                'carIndex': car.carIndex, 
-                'previous_spline': 0, 
+                'carIndex': car.carIndex,
+                'previous_spline': 0,
                 'laps': 0
             }
         if car.drivers:
@@ -375,8 +439,8 @@ class DataCollector(QThread):
 
         # Build current_positions (1-based) for non-finished, non-pitting cars
         current_positions = {
-            car['carIndex']: i+1 
-            for i, car in enumerate(sorted_cars) 
+            car['carIndex']: i+1
+            for i, car in enumerate(sorted_cars)
             if car['carIndex'] not in self.cars_in_pits and car['carIndex'] not in self.finished_cars
         }
 
