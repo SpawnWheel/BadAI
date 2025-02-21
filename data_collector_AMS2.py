@@ -33,6 +33,7 @@ GAME_INGAME_RESTARTING = 5
 GAME_INGAME_REPLAY = 6
 GAME_FRONT_END_REPLAY = 7
 
+
 class DataCollector(QThread):
     output_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
@@ -58,6 +59,8 @@ class DataCollector(QThread):
         self.initial_event_time_remaining = None
         self.race_start_system_time = None
         self.previous_race_state = None  # To detect race state changes
+        self.overtake_buffer = {}  # Store recent position changes
+        self.overtake_update_interval = 1.0  # Update interval in seconds
 
     def setup_shared_memory(self):
         """Sets up access to the shared memory file."""
@@ -95,14 +98,14 @@ class DataCollector(QThread):
         """Calculates the speed in km/h of a participant."""
         prev_time = self.previous_times.get(participant_index)
         prev_distance = self.previous_distances.get(participant_index)
-        
+
         if prev_time is not None and prev_distance is not None:
             time_diff = current_time - prev_time
             distance_diff = total_distance - prev_distance
 
             if time_diff > 0 and distance_diff >= 0:
                 speed_kph = (distance_diff / time_diff) * 3.6  # Convert m/s to km/h
-                
+
                 if 0 <= speed_kph <= 400:  # Filter unrealistic speeds
                     return speed_kph
         return None
@@ -211,14 +214,30 @@ class DataCollector(QThread):
             # Output final leaderboard
             self.output_leaderboard(data, session_time_elapsed, label="Final positions")
 
-        # Overtake reporting every 4 seconds, but not during the first 15 seconds
-        update_overtakes = session_time_elapsed - self.last_overtake_update >= 4 and session_time_elapsed >= 15
+        # Overtake reporting every 1 second, but not during the first 15 seconds
+        update_overtakes = session_time_elapsed - self.last_overtake_update >= self.overtake_update_interval and session_time_elapsed >= 15
+
+        # Create current position mapping
+        current_positions = {}
+        position_to_name = {}
+        active_participants = {}
 
         for i in range(data.mNumParticipants):
             participant_data = data.mParticipantInfo[i]
             participant_name = participant_data.mName.decode('utf-8').strip('\x00')
 
             if participant_data.mIsActive and participant_name != "Safety Car":
+                # Store active participant data
+                active_participants[i] = {
+                    'name': participant_name,
+                    'position': participant_data.mRacePosition,
+                    'current_lap': participant_data.mCurrentLap,
+                    'lap_distance': participant_data.mCurrentLapDistance
+                }
+
+                current_positions[i] = participant_data.mRacePosition
+                position_to_name[participant_data.mRacePosition] = participant_name
+
                 # Initialize previous finish status if not already set
                 prev_finish_status = self.previous_finish_status.get(i, RACESTATE_INVALID)
                 current_finish_status = data.mRaceStates[i]
@@ -254,37 +273,41 @@ class DataCollector(QThread):
                         elif pit_mode == 3:  # Exiting pits
                             self.last_pit_latch[i] = None
 
-                        # Record accident if not latched in pits
+                        # Initialize previous speed if not exists
+                        if not hasattr(self, 'previous_speeds'):
+                            self.previous_speeds = {}
+
+                        # Get previous speed
+                        prev_speed = self.previous_speeds.get(i, speed_kph)
+
+                        # Calculate speed drop if previous speed exists
+                        speed_drop = prev_speed - speed_kph if prev_speed is not None else 0
+
+                        # Record accident if not latched in pits and meets accident criteria
                         if self.last_pit_latch.get(i) is None:
-                            if speed_kph < 20 and current_lap > 1 and session_time_elapsed >= 3:
+                            # Accident detection conditions:
+                            # 1. Speed below 40 km/h and not in first lap
+                            # 2. Sudden speed drop (more than 50 km/h)
+                            # 3. Not just started the session
+                            if ((speed_kph < 40 and current_lap > 1) or (
+                                    speed_drop > 50)) and session_time_elapsed >= 3:
                                 if not self.accident_logged.get(i, False):
-                                    accident_event = f"{self.format_time(session_time_elapsed)} - Accident involving: {participant_name}"
+                                    accident_event = f"{self.format_time(session_time_elapsed)} - Possible accident involving: {participant_name} (Speed: {speed_kph:.1f} km/h, Drop: {speed_drop:.1f} km/h)"
                                     self.log_event(accident_event)
                                     self.accident_logged[i] = True
+                                    self.last_accident_time = session_time_elapsed  # Track when the accident was logged
 
-                        # Reset accident logged flag when speed exceeds 100 km/h
-                        if speed_kph > 100:
+                        # Only reset accident logged flag if:
+                        # 1. Enough time has passed since the accident (5 seconds)
+                        # 2. Speed is back to normal
+                        # 3. No sudden speed drops
+                        if speed_kph > 70 and speed_drop < 20 and \
+                                hasattr(self, 'last_accident_time') and \
+                                (session_time_elapsed - self.last_accident_time) > 5:
                             self.accident_logged[i] = False
 
-                # Detect overtakes (only update every 4 seconds after 15 seconds have passed)
-                if update_overtakes and self.race_started and not self.race_completed:
-                    current_position = participant_data.mRacePosition
-                    previous_position = self.previous_positions.get(i)
-
-                    if previous_position and previous_position != current_position:
-                        # Find the driver who was overtaken
-                        for j in range(data.mNumParticipants):
-                            if j != i:
-                                overtaken_data = data.mParticipantInfo[j]
-                                overtaken_name = overtaken_data.mName.decode('utf-8').strip('\x00')
-                                if overtaken_data.mIsActive and overtaken_name != "Safety Car":
-                                    if self.previous_positions.get(j) == current_position:
-                                        overtake_event = f"{self.format_time(session_time_elapsed)} - Overtake! {participant_name} overtook {overtaken_name} for position {current_position}"
-                                        self.log_event(overtake_event)
-                                        break  # Assuming only one overtake per position change
-
-                    # Update previous position
-                    self.previous_positions[i] = current_position
+                        # Update previous speed
+                        self.previous_speeds[i] = speed_kph
 
                 # Update previous distance and time
                 self.previous_distances[i] = total_distance
@@ -294,6 +317,39 @@ class DataCollector(QThread):
                 # For inactive participants or safety car, remove from previous positions
                 if i in self.previous_positions:
                     del self.previous_positions[i]
+
+        # Detect overtakes with improved logic
+        if update_overtakes and self.race_started and not self.race_completed:
+            for driver_index, current_pos in current_positions.items():
+                prev_pos = self.previous_positions.get(driver_index)
+
+                if prev_pos is not None and prev_pos != current_pos:
+                    driver_name = active_participants[driver_index]['name']
+
+                    # Determine if it's a gain or loss in position
+                    if current_pos < prev_pos:  # Gained position (lower number is better)
+                        # Find who was overtaken
+                        for other_index, other_pos in current_positions.items():
+                            if other_index != driver_index:
+                                other_prev_pos = self.previous_positions.get(other_index)
+                                if other_prev_pos is not None:
+                                    # Check if other driver moved back as this driver moved forward
+                                    if other_prev_pos == current_pos and other_pos == prev_pos:
+                                        other_name = active_participants[other_index]['name']
+
+                                        # Additional validation using lap and distance data
+                                        driver_data = active_participants[driver_index]
+                                        other_data = active_participants[other_index]
+
+                                        # Only log overtake if they're on the same lap or one lap difference
+                                        lap_diff = abs(driver_data['current_lap'] - other_data['current_lap'])
+                                        if lap_diff <= 1:
+                                            overtake_event = f"{self.format_time(session_time_elapsed)} - Overtake! {driver_name} overtook {other_name} for position {current_pos}"
+                                            self.log_event(overtake_event)
+                                        break
+
+            # Update previous positions
+            self.previous_positions = current_positions.copy()
 
         if update_overtakes and session_time_elapsed >= 15:
             self.last_overtake_update = session_time_elapsed
@@ -329,9 +385,11 @@ class DataCollector(QThread):
         """Stops the data collection process."""
         self.running = False
 
+
 def main():
     collector = DataCollector()
     collector.run()
+
 
 if __name__ == "__main__":
     main()
