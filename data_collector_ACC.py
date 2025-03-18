@@ -59,6 +59,17 @@ class DataCollector(QThread):
         self.UPPER_THRESHOLD = 0.9
         self.LOWER_THRESHOLD = 0.1
 
+        # Session state tracking for file creation
+        self.previous_session_type = None
+        self.previous_session_phase = None
+
+        # New variables for accident detection
+        self.cars_in_accident = {}  # Dictionary to track cars in accident state
+        self.previous_speeds = {}  # Dictionary to track previous speeds
+        self.accident_speed_threshold = 30  # kph - report accident below this speed
+        self.accident_recovery_threshold = 100  # kph - reset accident flag when exceeding this speed
+        self.race_start_immunity = 20.0  # seconds to ignore accidents after race start
+
     def run(self):
         """Main execution loop for data collection."""
         self.running = True
@@ -182,6 +193,38 @@ class DataCollector(QThread):
 
     def on_realtime_update(self, event):
         update = event.content
+
+        # Check if session type has changed
+        current_session_type = update.sessionType
+        current_session_phase = update.sessionPhase
+
+        # Check if we need to create a new file - only create a new file when:
+        # 1. Switching TO Qualifying from any other session type
+        # 2. Switching FROM Qualifying to any other session type
+        if self.previous_session_type is not None:
+            switching_to_qualifying = (current_session_type == "Qualify" and self.previous_session_type != "Qualify")
+            switching_from_qualifying = (current_session_type != "Qualify" and self.previous_session_type == "Qualify")
+
+            if switching_to_qualifying or switching_from_qualifying:
+                self.output_signal.emit(
+                    f"Session type changed from {self.previous_session_type} to {current_session_type}")
+
+                # Create a new file with appropriate label
+                if current_session_type == "Qualify":
+                    self.setup_output_file("Qualifying")
+                else:
+                    self.setup_output_file("Race")
+
+                self.log_event(f"New session started: {current_session_type} - {current_session_phase}")
+            else:
+                # Just log the session change without creating a new file
+                if self.previous_session_type != current_session_type or self.previous_session_phase != current_session_phase:
+                    self.log_event(f"Session changed: {current_session_type} - {current_session_phase}")
+
+        # Update previous session state
+        self.previous_session_type = current_session_type
+        self.previous_session_phase = current_session_phase
+
         self.session_info = {
             "sessionType": update.sessionType,
             "sessionPhase": update.sessionPhase,
@@ -238,10 +281,18 @@ class DataCollector(QThread):
                 self.corner_data = json.load(f)
             self.output_signal.emit(f"Loaded corner data for track: {self.track_name}")
         else:
-            self.output_signal.emit(f"No corner data found for track: {self.track_name}. Overtake locations will not include corner names.")
+            self.output_signal.emit(
+                f"No corner data found for track: {self.track_name}. Overtake locations will not include corner names.")
 
     def on_realtime_car_update(self, event):
         car = event.content
+
+        # Get the current speed
+        current_speed = car.kmh if hasattr(car, 'kmh') else 0
+
+        # Store the current speed for future reference
+        if car.carIndex not in self.previous_speeds:
+            self.previous_speeds[car.carIndex] = current_speed
 
         # Initialize the dictionary for this car if needed
         if car.carIndex not in self.cars:
@@ -258,6 +309,7 @@ class DataCollector(QThread):
             'laps': car.laps,  # We'll still store it, but won't use it for adjusted_progress
             'splinePosition': car.splinePosition,
             'location': car.location,
+            'speed': current_speed,  # Store speed in the car data
         })
 
         # -------------------------------
@@ -325,6 +377,50 @@ class DataCollector(QThread):
                 self.log_event(f"{driver_name} has exited the pits.")
 
         # -------------------------------
+        # ACCIDENT DETECTION
+        # -------------------------------
+        if self.race_started and car.carIndex not in self.finished_cars:
+            # Skip cars in pits and the first 20 seconds after race start
+            session_elapsed = self.session_time_ms / 1000
+            if (car.carIndex not in self.cars_in_pits and
+                    session_elapsed > self.race_start_immunity):
+
+                # Check if speed dropped below threshold
+                if (current_speed < self.accident_speed_threshold and
+                        car.carIndex not in self.cars_in_accident):
+
+                    # Get corner information
+                    corner_name = None
+                    if self.corner_data:
+                        corner_name = self.get_corner_name(car.splinePosition)
+
+                    # Create location description
+                    location_info = f" at {corner_name}" if corner_name else ""
+                    position_info = f" from P{current_car.get('position', '?')}"
+
+                    # Report accident
+                    driver_name = current_car.get('driverName', f"Car {car.carIndex}")
+                    self.log_event(f"Accident! {driver_name} has stopped{position_info}{location_info}")
+
+                    # Add to cars in accident dictionary
+                    self.cars_in_accident[car.carIndex] = {
+                        'time': session_elapsed,
+                        'location': corner_name
+                    }
+
+                # Check if car has recovered (speed above recovery threshold)
+                elif (car.carIndex in self.cars_in_accident and
+                      current_speed > self.accident_recovery_threshold):
+
+                    driver_name = current_car.get('driverName', f"Car {car.carIndex}")
+
+                    # Simple recovery message without time or location
+                    self.log_event(f"{driver_name} appears to be moving again.")
+
+                    # Remove from accident tracking
+                    del self.cars_in_accident[car.carIndex]
+
+        # -------------------------------
         # CHECK IF A CAR HAS FINISHED AFTER THE LEADER
         # -------------------------------
         # Once leader_finished == True, the checkered is out for everyone.
@@ -342,6 +438,9 @@ class DataCollector(QThread):
                 driver_name = current_car.get('driverName', f"Car {car.carIndex}")
                 self.log_event(f"{driver_name} has finished in position {finish_position}.")
                 self.finished_cars.add(car.carIndex)
+
+        # Update the previous speed after all processing
+        self.previous_speeds[car.carIndex] = current_speed
 
     def on_entry_list_car_update(self, event):
         car = event.content
@@ -363,20 +462,7 @@ class DataCollector(QThread):
         if event_type == "Session Over":
             self.log_event("Leader is on final lap")
             self.final_lap_phase = True
-        elif event_type == "Accident":
-            accident_time = self.format_session_time(self.session_time_ms)
-            car_index = event_content.carIndex
-
-            if car_index not in self.finished_cars:
-                try:
-                    driver = self.cars[car_index].get('driverName', f'Car {car_index}')
-                except KeyError:
-                    driver = f'Unknown Car {car_index}'
-
-                if accident_time not in self.current_accidents:
-                    self.current_accidents[accident_time] = []
-
-                self.current_accidents[accident_time].append(driver)
+        # We're ignoring the built-in accident events since we have our own detection
 
     def check_race_finish(self):
         """
@@ -404,7 +490,7 @@ class DataCollector(QThread):
     def report_qualifying_results(self):
         qualifying_order = self.get_qualifying_order()
         result_string = "Qualifying results: " + ", ".join(
-            f"(P{car.get('position', i+1)}) {car.get('driverName', f'Car {car['carIndex']}')} ({car.get('nationality', 'Unknown')})"
+            f"(P{car.get('position', i + 1)}) {car.get('driverName', f'Car {car['carIndex']}')} ({car.get('nationality', 'Unknown')})"
             for i, car in enumerate(qualifying_order)
         )
         self.log_event(result_string)
@@ -439,7 +525,7 @@ class DataCollector(QThread):
 
         # Build current_positions (1-based) for non-finished, non-pitting cars
         current_positions = {
-            car['carIndex']: i+1
+            car['carIndex']: i + 1
             for i, car in enumerate(sorted_cars)
             if car['carIndex'] not in self.cars_in_pits and car['carIndex'] not in self.finished_cars
         }
@@ -456,13 +542,6 @@ class DataCollector(QThread):
         # Announce overtakes
         for overtake in overtakes:
             self.log_event(overtake)
-
-        # Announce accidents
-        accidents = self.current_accidents
-        self.current_accidents = {}  # Clear after processing
-        for accident_time, drivers in accidents.items():
-            drivers_str = ", ".join(drivers)
-            self.log_event(f"Accident involving: {drivers_str}")
 
     def detect_overtakes(self, current_positions, current_progress):
         """
@@ -552,16 +631,25 @@ class DataCollector(QThread):
         minutes, seconds = divmod(remainder, 60)
         return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
 
-    def setup_output_file(self):
+    def setup_output_file(self, session_name=None):
+        """Set up output file with optional session name for session changes"""
         if not os.path.exists("Race Data"):
             os.makedirs("Race Data")
 
         start_time = datetime.now()
-        filename = start_time.strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+
+        # Include session name in filename if provided
+        if session_name:
+            filename = start_time.strftime("%Y-%m-%d_%H-%M-%S") + f"_{session_name}.txt"
+        else:
+            filename = start_time.strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+
         self.output_file = os.path.join("Race Data", filename)
 
         with open(self.output_file, 'w', encoding='utf-8') as f:
             f.write(f"Race data collection started at: {start_time}\n\n")
+            if session_name:
+                f.write(f"Session: {session_name}\n\n")
 
     def log_event(self, event):
         formatted_time = self.format_session_time(self.session_time_ms)
