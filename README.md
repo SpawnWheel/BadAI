@@ -1,7 +1,7 @@
 # BadAI
 AI Commentary for Sim Racing
 
-Current version is V18.06
+Current version is V23.02
 
 There is no how to yet, I will make one in time. 
 
