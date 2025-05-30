@@ -56,8 +56,8 @@ class DataCollector(QThread):
         self.custom_laps = {}
 
         # Thresholds for detecting a crossing
-        self.UPPER_THRESHOLD = 0.9
-        self.LOWER_THRESHOLD = 0.1
+        self.UPPER_THRESHOLD = 0.8
+        self.LOWER_THRESHOLD = 0.2
 
         # Session state tracking for file creation
         self.previous_session_type = None
@@ -66,9 +66,9 @@ class DataCollector(QThread):
         # New variables for accident detection
         self.cars_in_accident = {}  # Dictionary to track cars in accident state
         self.previous_speeds = {}  # Dictionary to track previous speeds
-        self.accident_speed_threshold = 30  # kph - report accident below this speed
-        self.accident_recovery_threshold = 100  # kph - reset accident flag when exceeding this speed
-        self.race_start_immunity = 20.0  # seconds to ignore accidents after race start
+        self.accident_speed_threshold = 35  # kph - report accident below this speed
+        self.accident_recovery_threshold = 80  # kph - reset accident flag when exceeding this speed
+        self.race_start_immunity = 10.0  # seconds to ignore accidents after race start
 
     def run(self):
         """Main execution loop for data collection."""

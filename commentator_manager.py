@@ -1,6 +1,6 @@
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
 
 
@@ -11,66 +11,24 @@ class CommentatorMetadata:
     style: str
     examples: list[str]
     voice_id: str
+    voice_speed: str = "normal"
+    voice_emotions: list[str] = field(default_factory=list)
+    voice_intensity: str = "medium"
 
 
 class CommentatorManager:
     def __init__(self):
         self.base_dir = "Commentators"
         self._ensure_base_directory()
-        self._ensure_default_commentator()
 
     def _ensure_base_directory(self):
         """Create the base Commentators directory if it doesn't exist."""
         os.makedirs(self.base_dir, exist_ok=True)
 
-    def _ensure_default_commentator(self):
-        """Set up the default Geoff commentator if it doesn't exist."""
-        geoff_dir = os.path.join(self.base_dir, "Geoff")
-        if not os.path.exists(geoff_dir):
-            os.makedirs(geoff_dir)
-
-            # Copy existing prompt files
-            source_files = {
-                "race_commentator_prompt.txt": "prompt.txt",
-                "second_commentator.txt": "second_pass_prompt.txt"
-            }
-
-            for source, dest in source_files.items():
-                if os.path.exists(source):
-                    shutil.copy2(source, os.path.join(geoff_dir, dest))
-
-            # Create metadata file
-            self._create_metadata_file(
-                geoff_dir,
-                "Geoff",
-                "Overly enthusiastic and awkward racing commentator",
-                "Comedic with technical knowledge",
-                [
-                    "OH MY GOODNESS folks, look at that perfectly executed apex entry!",
-                    "You know what I always say about downforce - if you're not forcing down, you're forcing up.",
-                    "I feel God in this paddock tonight."
-                ],
-                "Mw9TampTt4PGYMa0FYBO"  # Default voice ID
-            )
-        else:
-            # Ensure the metadata file exists even if the directory already exists
-            metadata_path = os.path.join(geoff_dir, "metadata.txt")
-            if not os.path.exists(metadata_path):
-                self._create_metadata_file(
-                    geoff_dir,
-                    "Geoff",
-                    "Overly enthusiastic and awkward racing commentator",
-                    "Comedic with technical knowledge",
-                    [
-                        "OH MY GOODNESS folks, look at that perfectly executed apex entry!",
-                        "You know what I always say about downforce - if you're not forcing down, you're forcing up.",
-                        "I feel God in this paddock tonight."
-                    ],
-                    "Mw9TampTt4PGYMa0FYBO"  # Default voice ID
-                )
-
     def _create_metadata_file(self, commentator_dir: str, name: str, personality: str,
-                              style: str, examples: list[str], voice_id: str):
+                              style: str, examples: list[str], voice_id: str,
+                              voice_speed: str = "normal", voice_emotions: list[str] = None,
+                              voice_intensity: str = "medium"):
         """Create a metadata file for a commentator."""
         metadata_path = os.path.join(commentator_dir, "metadata.txt")
         with open(metadata_path, 'w', encoding='utf-8') as f:
@@ -80,11 +38,22 @@ class CommentatorManager:
             f.write("[EXAMPLES]\n")
             for example in examples:
                 f.write(f"{example}\n")
-            f.write(f"\n[VOICE_ID]\n{voice_id}\n")
+            f.write(f"\n[VOICE_ID]\n{voice_id}\n\n")
+            f.write(f"[VOICE_SPEED]\n{voice_speed}\n\n")
+
+            f.write("[VOICE_EMOTIONS]\n")
+            if voice_emotions:
+                for emotion in voice_emotions:
+                    f.write(f"{emotion}\n")
+            f.write("\n")
+
+            f.write(f"[VOICE_INTENSITY]\n{voice_intensity}\n")
 
     def create_commentator(self, name: str, personality: str, style: str,
                            examples: list[str], voice_id: str,
-                           main_prompt: str, second_pass_prompt: str) -> bool:
+                           voice_speed: str = "normal", voice_emotions: list[str] = None,
+                           voice_intensity: str = "medium",
+                           main_prompt: str = None, second_pass_prompt: str = None) -> bool:
         """Create a new commentator with the given details."""
         dir_name = name.replace(" ", "_")
         commentator_dir = os.path.join(self.base_dir, dir_name)
@@ -95,19 +64,24 @@ class CommentatorManager:
         os.makedirs(commentator_dir)
 
         # Create metadata file
-        self._create_metadata_file(commentator_dir, name, personality, style, examples, voice_id)
+        self._create_metadata_file(
+            commentator_dir, name, personality, style, examples, voice_id,
+            voice_speed, voice_emotions, voice_intensity
+        )
 
         # Create prompt files
         with open(os.path.join(commentator_dir, "prompt.txt"), 'w', encoding='utf-8') as f:
-            f.write(main_prompt)
+            f.write(main_prompt if main_prompt else "")
 
         with open(os.path.join(commentator_dir, "second_pass_prompt.txt"), 'w', encoding='utf-8') as f:
-            f.write(second_pass_prompt)
+            f.write(second_pass_prompt if second_pass_prompt else "")
 
         return True
 
     def update_commentator(self, original_name: str, name: str, personality: str,
                            style: str, examples: list[str], voice_id: str,
+                           voice_speed: str = "normal", voice_emotions: list[str] = None,
+                           voice_intensity: str = "medium",
                            main_prompt: Optional[str] = None,
                            second_pass_prompt: Optional[str] = None) -> bool:
         """Update an existing commentator's details."""
@@ -124,7 +98,10 @@ class CommentatorManager:
             current_dir = original_dir
 
         # Update metadata
-        self._create_metadata_file(current_dir, name, personality, style, examples, voice_id)
+        self._create_metadata_file(
+            current_dir, name, personality, style, examples, voice_id,
+            voice_speed, voice_emotions, voice_intensity
+        )
 
         # Update prompts if provided
         if main_prompt is not None:
@@ -138,10 +115,7 @@ class CommentatorManager:
         return True
 
     def delete_commentator(self, name: str) -> bool:
-        """Delete a commentator. Cannot delete the default Geoff commentator."""
-        if name.lower() == "geoff":
-            return False
-
+        """Delete a commentator."""
         dir_path = os.path.join(self.base_dir, name.replace(" ", "_"))
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path)
@@ -162,7 +136,10 @@ class CommentatorManager:
                 'personality': '',
                 'style': '',
                 'examples': [],
-                'voice_id': ''
+                'voice_id': '',
+                'voice_speed': 'normal',
+                'voice_emotions': [],
+                'voice_intensity': 'medium'
             }
 
             current_section = None
@@ -173,8 +150,8 @@ class CommentatorManager:
                     if line.startswith('[') and line.endswith(']'):
                         current_section = line[1:-1].lower()
                     elif line and current_section:
-                        if current_section == 'examples':
-                            metadata['examples'].append(line)
+                        if current_section == 'examples' or current_section == 'voice_emotions':
+                            metadata[current_section].append(line)
                         else:
                             metadata[current_section] = line
 
@@ -187,7 +164,10 @@ class CommentatorManager:
                 personality=metadata['personality'],
                 style=metadata['style'],
                 examples=metadata['examples'],
-                voice_id=metadata['voice_id']
+                voice_id=metadata['voice_id'],
+                voice_speed=metadata['voice_speed'],
+                voice_emotions=metadata['voice_emotions'],
+                voice_intensity=metadata['voice_intensity']
             )
         except Exception as e:
             print(f"Error loading metadata for {name}: {e}")
@@ -216,7 +196,6 @@ class CommentatorManager:
             # Check if directory exists
             if not os.path.exists(self.base_dir):
                 self._ensure_base_directory()
-                self._ensure_default_commentator()
 
             # List directories in the base directory
             for dir_name in os.listdir(self.base_dir):
@@ -226,26 +205,7 @@ class CommentatorManager:
                     if metadata:
                         commentators.append(metadata)
 
-            # If no commentators found, create and add default
-            if not commentators:
-                self._ensure_default_commentator()
-                geoff_metadata = self.get_commentator_metadata("Geoff")
-                if geoff_metadata:
-                    commentators.append(geoff_metadata)
         except Exception as e:
             print(f"Error getting commentators: {e}")
-            # Always ensure we have at least a default commentator
-            geoff = CommentatorMetadata(
-                name="Geoff",
-                personality="Overly enthusiastic and awkward racing commentator",
-                style="Comedic with technical knowledge",
-                examples=[
-                    "OH MY GOODNESS folks, look at that perfectly executed apex entry!",
-                    "You know what I always say about downforce - if you're not forcing down, you're forcing up.",
-                    "I feel God in this paddock tonight."
-                ],
-                voice_id="Mw9TampTt4PGYMa0FYBO"
-            )
-            commentators.append(geoff)
 
         return commentators

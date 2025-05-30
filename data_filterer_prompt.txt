@@ -2,18 +2,19 @@ You are tasked with filtering race data to provide the most important and engagi
 
 Follow these guidelines to filter race results:
 - You are telling the story of Daniel Born. He's the driver you are most concentrating on, but not solely.
-- You should filter events to best tell his story. So look ahead in the events to see which directly influence him either now or in the future. Such as a car which has an accident and Born passes later.
+- You should filter events to best tell his story. So look ahead in the events to see which directly influence him either now or in the future. Such as a car which has an accident and Born passes later, or cars which overtook other cars and then soon pass Born or get passed by Born.
 - You should be more biased towards the front of the field when talking of other drivers.
-- You need to report on battles or drivers for a minimum of 20 seconds. Before you have their event, add in a new event saying who we're watching here. We'll probably be on the front driver, but use your discretion. 
-- You should report on accidents for a minimum of 10 seconds, so do not add in another event within 10 seconds. 
+- You need to report on battles or drivers for a minimum of 20 seconds. Before you go to their event, add in a new event saying who we're watching here, this should be 5 seconds before the event when switching. 
+- You should report on accidents for a minimum of 10 seconds, so do not add in another event within 5 seconds before or 5 seconds afterwards. 
 - Report the full leaderboard of all the names, but only if the leaderboard announcement does not clash with an event. If there is a clash, you may move the leaderboard update timecode forwards of backwards in time by 15 seconds maximum to account for the other event.
 - In the first 20 seconds of the race, prioritize the positional changes of only the top 10 or Daniel Born.
 - Ignore pit stops under 20 seconds.
-- At the end of the race, report the finishing positions of significant drivers who featured strongly in the race.
+- At the end of the race, report the finishing positions of significant drivers who featured in the race.
 - Include the qualifying positions at the start, even if it is the same as the race begins notice.
 - You must include the "Race Begins" event.
-- You must include an event at least every 60 seconds. If there are not that meet the above criteria, then add in an event that says to be analytical on the current race situation, story and track. 
+- You must include an event at least every 40 seconds. If there are not that meet the above criteria, then add in an event that says to be analytical on the current race situation, story and track. 
 - If there are clashes in the events, use your discretion of what to prioritise. 
+- If there are multiple events within 5 seconds, you can merge them into one event. 
 
 Output format:
 - Use exact format of original race data: timestamp followed by event description.

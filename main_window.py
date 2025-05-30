@@ -1,844 +1,624 @@
 # main_window.py
 import sys
+import os
+import shutil
+import re
+import json
+import traceback
+import google.generativeai as genai # Keep if used by any backend module
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QTabWidget, QGroupBox,
     QFormLayout, QLineEdit, QPushButton, QLabel, QHBoxLayout, QComboBox, QTextEdit,
-    QFileDialog, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QCheckBox
+    QFileDialog, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QCheckBox,
+    QDialog, QInputDialog, QDialogButtonBox, QSpinBox, QSizePolicy
 )
-from PyQt5.QtCore import QSettings, Qt
-from commentator_manager import CommentatorManager
-from commentator_dialog import CommentatorDialog
-from accident_settings_widget import AccidentSettingsWidget
+from PyQt5.QtCore import QSettings, Qt, QTimer, QElapsedTimer
+from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 
-# Import your existing modules for data collection, filtering, commentary, and voice generation.
+import pygame # Keep for init and audio
+
+# Backend Modules
+from commentator_manager import CommentatorManager
+from prompt_manager import PromptManager
 from data_collector_ACC import DataCollector as DataCollectorACC
 from data_collector_AMS2 import DataCollector as DataCollectorAMS2
 from data_collector_AC import DataCollector as DataCollectorAC
 from data_filterer import DataFilterer
 from race_commentator import RaceCommentator
 from voice_generator import VoiceGenerator
-from csv_creator_widget import CSVCreatorWidget
+from ams2_director import AMS2Director
+from cartesia import Cartesia
 
+# UI Modules
+from ui_setup_tab import SetupTab
+from ui_highlight_tab import HighlightReelTab
+from ui_commentary_tab import CommentaryTab
+from ui_voice_tab import VoiceTab
+from ui_director_tab import AutoDirectorTab
+from ui_settings_tab import SettingsTab
+from ui_prompt_dialog import PromptEditDialog # Keep the dialog import if used by highlight tab
+
+# --- Application Version ---
+VERSION = "23.01" # Update as needed
+# -------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Bad AI Commentary")
-        self.setGeometry(100, 100, 800, 600)
+        self.setWindowTitle(f"Bad AI Commentary - v{VERSION}")
+        self.setGeometry(100, 100, 1000, 800)
+        self.app = QApplication.instance() # Reference to the application instance
+
+        # --- Initialize Pygame ---
+        try:
+            pygame.init()
+            if not pygame.mixer.get_init():
+                 pygame.mixer.init()
+        except Exception as e:
+            print(f"ERROR: Failed to initialize pygame: {e}")
+            QMessageBox.critical(self, "Pygame Error", f"Failed to initialize Pygame: {e}")
+        # -------------------------
 
         self.settings = QSettings("BadAICommentary", "SimRacingCommentator")
         self.commentator_manager = CommentatorManager()
+        self.data_filterer_prompt_manager = PromptManager("DataFilterer")
+        # Ensure default prompt exists if none are found
+        self.data_filterer_prompt_manager.ensure_default_prompt("Default", "data_filterer_prompt.txt")
 
-        # Apply "Always on Top" based on saved settings
-        always_on_top = self.settings.value("always_on_top", False, type=bool)
-        if always_on_top:
-            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        # --- State Variables ---
+        self.current_console_widget = None # Track which QTextEdit receives general logs
+        self.last_filter_output_path = None # Store path from filterer
+        self.last_commentary_output_path = None # Store path from commentary
+        self.last_voice_output_dir = None # Store dir from voice gen
+
+        # --- Thread Placeholders ---
+        self.data_collector = None
+        self.data_filterer = None
+        self.race_commentator = None
+        self.voice_generator = None
+        self.ams2_director = None
+        # ---------------------------
+
+        self._apply_always_on_top()
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
 
-        # Set up tab widget with signal connections for tab switching
-        self.setup_tab_widget()  # Use our new method instead
+        self._setup_tab_widget()
+        self._setup_status_bar()
 
-        self.data_collector = None
-        self.data_filterer = None
-        self.race_commentator = None
-        self.voice_generator = None
+        # --- Initial Population ---
+        self.refresh_all_commentator_data() # Populates all commentator lists/combos
+        self.refresh_all_prompt_data() # Populates filterer prompt list
 
-        # Set up the individual tabs
-        self.setup_setup_tab()
-        self.setup_highlight_reel_tab()
-        self.setup_commentary_tab()
-        self.setup_voice_tab()
-        self.setup_settings_tab()
+        # --- Initialize main console ---
+        # Setup tab is created first, use its console initially
+        if hasattr(self, 'setup_tab') and self.setup_tab:
+             self.switch_main_console(self.setup_tab.get_console_output_widget())
+        else:
+             print("Warning: SetupTab not initialized before console switch.")
 
-        # Refresh commentator combos after all tabs are set up
-        self.refresh_commentator_combos()
+        print("MainWindow initialization complete")
 
+    def _apply_always_on_top(self):
+        """Applies the always-on-top setting from QSettings."""
+        always_on_top = self.settings.value("always_on_top", False, type=bool)
+        if always_on_top:
+            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        else:
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+        # Don't call self.show() here, happens later
+
+    def set_always_on_top(self, enabled: bool):
+        """Sets or clears the always-on-top flag."""
+        if enabled:
+            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        else:
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+        self.show() # Re-show to apply changes
+
+    def _setup_status_bar(self):
+        """Initializes the status bar and progress bar."""
         self.status_bar = self.statusBar()
         self.progress_bar = QProgressBar()
         self.status_bar.addPermanentWidget(self.progress_bar)
+        self.progress_bar.setValue(0) # Start at 0
 
-        # Debug output
-        print("MainWindow initialization complete")
-        print(f"Commentator count: {len(self.commentator_manager.get_all_commentators())}")
-
-    def setup_tab_widget(self):
-        """Set up the tab widget and connect tab change signals."""
+    def _setup_tab_widget(self):
+        """Creates and populates the main tab widget."""
         self.tab_widget = QTabWidget()
         self.layout.addWidget(self.tab_widget)
 
-        self.setup_tab = QWidget()
-        self.highlight_reel_tab = QWidget()
-        self.commentary_tab = QWidget()
-        self.voice_tab = QWidget()
-        self.settings_tab = QWidget()
+        # Instantiate tab widgets, passing self (MainWindow)
+        self.setup_tab = SetupTab(self)
+        self.highlight_reel_tab = HighlightReelTab(self)
+        self.commentary_tab = CommentaryTab(self)
+        self.voice_tab = VoiceTab(self)
+        self.auto_director_tab = AutoDirectorTab(self)
+        self.settings_tab = SettingsTab(self)
 
+        # Add tabs
         self.tab_widget.addTab(self.setup_tab, "Let's go racing!")
         self.tab_widget.addTab(self.highlight_reel_tab, "Highlight Reel Creation")
         self.tab_widget.addTab(self.commentary_tab, "Commentary Generation")
         self.tab_widget.addTab(self.voice_tab, "Voice Generation")
+        self.tab_widget.addTab(self.auto_director_tab, "Auto Director")
         self.tab_widget.addTab(self.settings_tab, "Settings")
 
-        # Connect the tab changed signal
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
 
     def on_tab_changed(self, index):
-        """Handle tab changed event to refresh dynamic content."""
-        print(f"Switched to tab {index}")
+        """Refreshes relevant UI elements when switching tabs."""
+        # Currently, refreshes happen on data change rather than tab switch
+        # but we can add tab-specific actions here if needed.
+        widget = self.tab_widget.widget(index)
+        # Example: Ensure focus is set correctly
+        # if isinstance(widget, SetupTab) and widget.is_video_mode_active():
+        #     widget.video_player_widget.setFocus()
+        pass
 
-        # Commentary Generation tab
-        if index == 2:  # Commentary tab is index 2
-            print("Refreshing commentary tab combos")
-            self.refresh_commentator_combos()
-        # Voice Generation tab
-        elif index == 3:  # Voice tab is index 3
-            print("Refreshing voice tab combos")
-            self.update_commentator_combos(self.voice_commentator_combo, "voice_commentator")
+    def refresh_all_commentator_data(self):
+        """Fetches commentator data and updates all relevant UI elements."""
+        try:
+            commentators = self.commentator_manager.get_all_commentators()
+            main_selection = self.settings.value("main_commentator", "")
+            voice_selection = self.settings.value("voice_commentator", "")
 
-    def refresh_commentator_combos(self):
-        """Refresh all commentator combo boxes."""
-        print("Refreshing all commentator combo boxes")
+            # Update combos in tabs that have them
+            if hasattr(self, 'commentary_tab') and self.commentary_tab:
+                 self.commentary_tab.update_commentator_combo(commentators, main_selection)
+            if hasattr(self, 'voice_tab') and self.voice_tab:
+                 self.voice_tab.update_commentator_combo(commentators, voice_selection)
+            if hasattr(self, 'settings_tab') and self.settings_tab:
+                 self.settings_tab.update_commentator_list(commentators) # Update list in settings tab
+        except Exception as e:
+            self.update_console(f"Error refreshing commentator lists: {e}")
+            traceback.print_exc()
 
-        # Reload the commentator list to ensure we have the latest data
-        commentators = self.commentator_manager.get_all_commentators()
-        print(f"Found {len(commentators)} commentators")
+    def refresh_all_prompt_data(self):
+        """Updates the data filterer prompt list."""
+        if hasattr(self, 'highlight_reel_tab') and self.highlight_reel_tab:
+            self.highlight_reel_tab.update_data_filterer_prompts()
 
-        # Update the combo boxes
-        self.update_commentator_combos(self.main_commentator_combo, "main_commentator")
-        # If you have other combos, update them here too
+    # --- Console Switching ---
+    def switch_main_console(self, text_edit_widget: QTextEdit):
+        """Sets the target QTextEdit for general update_console messages."""
+        self.current_console_widget = text_edit_widget
+        # print(f"Switched main console output to: {text_edit_widget}") # Debug
 
-    def setup_setup_tab(self):
-        layout = QVBoxLayout(self.setup_tab)
-        sim_label = QLabel("Select your sim:")
-        self.sim_combo = QComboBox()
-        self.sim_combo.addItems(["Assetto Corsa Competizione", "Assetto Corsa", "Automobilista 2"])
+    # --- Thread Start Methods (called by Tabs) ---
 
-        # Add accident settings widget
-        self.accident_settings = AccidentSettingsWidget()
-        self.accident_settings.hide()  # Hidden by default
+    def start_data_collection(self, sim_name: str):
+        """Starts the appropriate data collector."""
+        if self.setup_tab.is_video_logging_active:
+             QMessageBox.warning(self, "Action Blocked", "Stop video logging first.")
+             return
+        if self.data_collector and self.data_collector.isRunning():
+             self.update_console("Data collector is already running.")
+             return
 
-        # Connect sim selection to show/hide settings
-        self.sim_combo.currentTextChanged.connect(self.on_sim_changed)
+        self.update_console(f"Starting data collection for {sim_name}...")
+        try:
+            if sim_name == "Assetto Corsa Competizione": CollectorClass = DataCollectorACC
+            elif sim_name == "Automobilista 2": CollectorClass = DataCollectorAMS2
+            elif sim_name == "Assetto Corsa": CollectorClass = DataCollectorAC
+            else: raise ValueError(f"Unknown sim: {sim_name}")
 
-        self.start_stop_button = QPushButton("Start")
-        self.start_stop_button.clicked.connect(self.toggle_data_collection)
+            self.data_collector = CollectorClass()
+            self.data_collector.output_signal.connect(self.update_console)
+            self.data_collector.progress_signal.connect(self.update_progress_bar)
+            self.data_collector.finished.connect(self.on_data_collector_finished)
+            self.data_collector.start()
 
-        self.console_output = QTextEdit()
-        self.console_output.setReadOnly(True)
+            self.setup_tab.update_button_state(collecting=True) # Update UI
+            self.update_console(f"{sim_name} data collector started.")
 
-        layout.addWidget(sim_label)
-        layout.addWidget(self.sim_combo)
-        layout.addWidget(self.accident_settings)
-        layout.addWidget(self.start_stop_button)
-        layout.addWidget(self.console_output)
-
-    def on_sim_changed(self, sim_name):
-        self.accident_settings.setVisible(sim_name == "Automobilista 2")
-
-    def toggle_data_collection(self):
-        if self.start_stop_button.text() == "Start":
-            self.start_data_collection()
-        else:
-            self.stop_data_collection()
-
-    def start_data_collection(self):
-        sim = self.sim_combo.currentText()
-        if sim == "Assetto Corsa Competizione":
-            self.data_collector = DataCollectorACC()
-        elif sim == "Assetto Corsa":
-            self.data_collector = DataCollectorAC()
-        else:
-            self.data_collector = DataCollectorAMS2()
-            # Update accident detection settings if it's AMS2
-            if hasattr(self, 'accident_settings'):
-                self.data_collector.update_accident_settings(
-                    self.accident_settings.speed_threshold.value(),
-                    self.accident_settings.time_threshold.value(),
-                    self.accident_settings.proximity_time.value()
-                )
-                # Connect value changed signals to update collector
-                self.accident_settings.speed_threshold.valueChanged.connect(
-                    lambda v: self.data_collector.update_accident_settings(
-                        v,
-                        self.accident_settings.time_threshold.value(),
-                        self.accident_settings.proximity_time.value()
-                    )
-                )
-                self.accident_settings.time_threshold.valueChanged.connect(
-                    lambda v: self.data_collector.update_accident_settings(
-                        self.accident_settings.speed_threshold.value(),
-                        v,
-                        self.accident_settings.proximity_time.value()
-                    )
-                )
-                self.accident_settings.proximity_time.valueChanged.connect(
-                    lambda v: self.data_collector.update_accident_settings(
-                        self.accident_settings.speed_threshold.value(),
-                        self.accident_settings.time_threshold.value(),
-                        v
-                    )
-                )
-
-        self.data_collector.output_signal.connect(self.update_console)
-        self.data_collector.progress_signal.connect(self.update_progress_bar)
-        self.data_collector.start()
-        self.start_stop_button.setText("Stop")
+        except Exception as e:
+             self.update_console(f"Error starting data collector: {e}\n{traceback.format_exc()}")
+             QMessageBox.critical(self, "Error", f"Failed to start data collector:\n{e}")
+             self.setup_tab.update_button_state(collecting=False) # Reset UI on error
 
     def stop_data_collection(self):
-        if hasattr(self, 'data_collector') and self.data_collector:
-            self.data_collector.stop()
-            self.update_console("Data collection stopped.")
-        self.start_stop_button.setText("Start")
-
-    def setup_highlight_reel_tab(self):
-        layout = QVBoxLayout(self.highlight_reel_tab)
-
-        # Data collection section
-        input_layout = QHBoxLayout()
-        data_path_label = QLabel("Enter the path to your race data file:")
-        self.data_path_input = QLineEdit()
-        browse_button = QPushButton("Browse")
-        browse_button.clicked.connect(self.browse_data_file)
-        filter_button = QPushButton("Filter Data")
-        filter_button.clicked.connect(self.filter_data)
-
-        input_layout.addWidget(data_path_label)
-        input_layout.addWidget(self.data_path_input)
-        input_layout.addWidget(browse_button)
-        input_layout.addWidget(filter_button)
-
-        # CSV Creator section
-        csv_creator_label = QLabel("Highlight Reel Editor")
-        load_csv_layout = QHBoxLayout()
-        load_csv_button = QPushButton("Load Existing File")
-        load_csv_button.clicked.connect(self.load_existing_file)
-        load_csv_layout.addWidget(load_csv_button)
-        load_csv_layout.addStretch()
-
-        self.csv_creator = CSVCreatorWidget()
-
-        layout.addLayout(input_layout)
-        layout.addWidget(csv_creator_label)
-        layout.addLayout(load_csv_layout)
-        layout.addWidget(self.csv_creator)
-
-    def setup_commentary_tab(self):
-        layout = QVBoxLayout(self.commentary_tab)
-
-        # Main commentator selection
-        main_commentator_layout = QVBoxLayout()
-        main_commentator_label = QLabel("Commentator:")
-        self.main_commentator_combo = QComboBox()
-        # We'll populate it directly instead of using update_commentator_combos
-        # Get all commentators
-        commentators = self.commentator_manager.get_all_commentators()
-        print(f"Setup tab found {len(commentators)} commentators")
-
-        # Add them to the combo box
-        for metadata in commentators:
-            display_text = f"{metadata.name} - {metadata.style}"
-            self.main_commentator_combo.addItem(display_text, metadata.name)
-            print(f"Added commentator: {display_text}")
-
-        # If empty, add a default
-        if self.main_commentator_combo.count() == 0:
-            self.main_commentator_combo.addItem("Geoff - Default", "Geoff")
-            print("Added default Geoff commentator")
-
-        # Set the saved selection if available
-        saved_commentator = self.settings.value("main_commentator", "Geoff")
-        for i in range(self.main_commentator_combo.count()):
-            if self.main_commentator_combo.itemData(i) == saved_commentator:
-                self.main_commentator_combo.setCurrentIndex(i)
-                print(f"Set selected commentator to {saved_commentator}")
-                break
-
-        # Connect index changed signal
-        self.main_commentator_combo.currentIndexChanged.connect(
-            lambda: self.settings.setValue("main_commentator", self.main_commentator_combo.currentData())
-        )
-
-        main_commentator_layout.addWidget(main_commentator_label)
-        main_commentator_layout.addWidget(self.main_commentator_combo)
-
-        layout.addLayout(main_commentator_layout)
-
-        # Rest of the existing commentary tab setup
-        input_label = QLabel("Input file:")
-        self.commentary_input = QLineEdit()
-        browse_button = QPushButton("Browse")
-        browse_button.clicked.connect(self.browse_commentary_input)
-
-        generate_button = QPushButton("Generate Commentary")
-        generate_button.clicked.connect(self.generate_commentary)
-
-        self.commentary_output = QTextEdit()
-        self.commentary_output.setReadOnly(True)
-
-        layout.addWidget(input_label)
-        layout.addWidget(self.commentary_input)
-        layout.addWidget(browse_button)
-        layout.addWidget(generate_button)
-        layout.addWidget(self.commentary_output)
-
-        print(f"Commentary tab setup complete, combo box has {self.main_commentator_combo.count()} items")
-
-    def setup_voice_tab(self):
-        layout = QVBoxLayout(self.voice_tab)
-
-        # Add commentator selection
-        commentator_layout = QVBoxLayout()
-        commentator_label = QLabel("Select Commentator Voice:")
-        self.voice_commentator_combo = QComboBox()
-
-        # Get all commentators
-        commentators = self.commentator_manager.get_all_commentators()
-        print(f"Voice tab found {len(commentators)} commentators")
-
-        # Add them to the combo box
-        for metadata in commentators:
-            display_text = f"{metadata.name} - {metadata.style}"
-            self.voice_commentator_combo.addItem(display_text, metadata.name)
-            print(f"Added voice commentator: {display_text}")
-
-        # If empty, add a default
-        if self.voice_commentator_combo.count() == 0:
-            self.voice_commentator_combo.addItem("Geoff - Default", "Geoff")
-            print("Added default Geoff voice commentator")
-
-        # Set the saved selection if available
-        saved_commentator = self.settings.value("voice_commentator", "Geoff")
-        for i in range(self.voice_commentator_combo.count()):
-            if self.voice_commentator_combo.itemData(i) == saved_commentator:
-                self.voice_commentator_combo.setCurrentIndex(i)
-                print(f"Set selected voice commentator to {saved_commentator}")
-                break
-
-        # Connect index changed signal
-        self.voice_commentator_combo.currentIndexChanged.connect(
-            lambda: self.settings.setValue("voice_commentator", self.voice_commentator_combo.currentData())
-        )
-
-        commentator_layout.addWidget(commentator_label)
-        commentator_layout.addWidget(self.voice_commentator_combo)
-
-        input_label = QLabel("Input file:")
-        self.voice_input = QLineEdit()
-        browse_button = QPushButton("Browse")
-        browse_button.clicked.connect(self.browse_voice_input)
-
-        generate_button = QPushButton("Generate Voice Commentary")
-        generate_button.clicked.connect(self.generate_voice)
-
-        self.voice_output = QTextEdit()
-        self.voice_output.setReadOnly(True)
-
-        layout.addLayout(commentator_layout)
-        layout.addWidget(input_label)
-        layout.addWidget(self.voice_input)
-        layout.addWidget(browse_button)
-        layout.addWidget(generate_button)
-        layout.addWidget(self.voice_output)
-
-        print(f"Voice tab setup complete, combo box has {self.voice_commentator_combo.count()} items")
-
-    def setup_settings_tab(self):
-        layout = QVBoxLayout(self.settings_tab)
-
-        # API Keys Section
-        api_keys_group = QGroupBox("API Keys")
-        api_keys_layout = QFormLayout()
-
-        self.claude_api_key_input = QLineEdit()
-        self.claude_api_key_input.setEchoMode(QLineEdit.Password)
-        self.claude_api_key_input.setText(self.settings.value("claude_api_key", ""))
-
-        self.openai_api_key_input = QLineEdit()
-        self.openai_api_key_input.setEchoMode(QLineEdit.Password)
-        self.openai_api_key_input.setText(self.settings.value("openai_api_key", ""))
-
-        self.eleven_labs_api_key_input = QLineEdit()
-        self.eleven_labs_api_key_input.setEchoMode(QLineEdit.Password)
-        self.eleven_labs_api_key_input.setText(self.settings.value("eleven_labs_api_key", ""))
-
-        api_keys_layout.addRow("Claude API Key:", self.claude_api_key_input)
-        api_keys_layout.addRow("OpenAI API Key:", self.openai_api_key_input)
-        api_keys_layout.addRow("ElevenLabs API Key:", self.eleven_labs_api_key_input)
-        api_keys_group.setLayout(api_keys_layout)
-
-        # Model Selection Section
-        model_selection_group = QGroupBox("Model Selection")
-        model_selection_layout = QVBoxLayout()
-
-        # Data Filterer Settings
-        data_filterer_group = QGroupBox("Data Filterer")
-        data_filterer_layout = QVBoxLayout()
-
-        self.data_filterer_api_group = QButtonGroup()
-        self.data_filterer_claude_radio = QRadioButton("Claude")
-        self.data_filterer_openai_radio = QRadioButton("OpenAI")
-        self.data_filterer_api_group.addButton(self.data_filterer_claude_radio)
-        self.data_filterer_api_group.addButton(self.data_filterer_openai_radio)
-
-        if self.settings.value("data_filterer_api", "claude") == "claude":
-            self.data_filterer_claude_radio.setChecked(True)
-        else:
-            self.data_filterer_openai_radio.setChecked(True)
-
-        self.data_filterer_model_input = QLineEdit()
-        self.data_filterer_model_input.setText(self.settings.value("data_filterer_model", "claude-3-5-sonnet-20241022"))
-
-        data_filterer_layout.addWidget(self.data_filterer_claude_radio)
-        data_filterer_layout.addWidget(self.data_filterer_openai_radio)
-        data_filterer_layout.addWidget(QLabel("Model:"))
-        data_filterer_layout.addWidget(self.data_filterer_model_input)
-        data_filterer_group.setLayout(data_filterer_layout)
-
-        # Race Commentator Settings
-        race_commentator_group = QGroupBox("Race Commentator")
-        race_commentator_layout = QVBoxLayout()
-
-        self.race_commentator_api_group = QButtonGroup()
-        self.race_commentator_claude_radio = QRadioButton("Claude")
-        self.race_commentator_openai_radio = QRadioButton("OpenAI")
-        self.race_commentator_api_group.addButton(self.race_commentator_claude_radio)
-        self.race_commentator_api_group.addButton(self.race_commentator_openai_radio)
-
-        if self.settings.value("race_commentator_api", "claude") == "claude":
-            self.race_commentator_claude_radio.setChecked(True)
-        else:
-            self.race_commentator_openai_radio.setChecked(True)
-
-        self.race_commentator_model_input = QLineEdit()
-        self.race_commentator_model_input.setText(
-            self.settings.value("race_commentator_model", "claude-3-5-sonnet-20241022"))
-
-        race_commentator_layout.addWidget(self.race_commentator_claude_radio)
-        race_commentator_layout.addWidget(self.race_commentator_openai_radio)
-        race_commentator_layout.addWidget(QLabel("Model:"))
-        race_commentator_layout.addWidget(self.race_commentator_model_input)
-        race_commentator_group.setLayout(race_commentator_layout)
-
-        model_selection_layout.addWidget(data_filterer_group)
-        model_selection_layout.addWidget(race_commentator_group)
-        model_selection_group.setLayout(model_selection_layout)
-
-        # Commentator Management Section
-        commentator_group = QGroupBox("Commentator Management")
-        commentator_layout = QVBoxLayout()
-
-        # Commentator list
-        self.commentator_list = QComboBox()
-        self.update_commentator_list()
-
-        # Buttons
-        commentator_buttons_layout = QHBoxLayout()
-        add_commentator_button = QPushButton("Add Commentator")
-        add_commentator_button.clicked.connect(self.add_commentator)
-        edit_commentator_button = QPushButton("Edit Commentator")
-        edit_commentator_button.clicked.connect(self.edit_commentator)
-        delete_commentator_button = QPushButton("Delete Commentator")
-        delete_commentator_button.clicked.connect(self.delete_commentator)
-
-        commentator_buttons_layout.addWidget(add_commentator_button)
-        commentator_buttons_layout.addWidget(edit_commentator_button)
-        commentator_buttons_layout.addWidget(delete_commentator_button)
-
-        commentator_layout.addWidget(self.commentator_list)
-        commentator_layout.addLayout(commentator_buttons_layout)
-        commentator_group.setLayout(commentator_layout)
-
-        # Always on Top Toggle
-        self.always_on_top_checkbox = QCheckBox("Always on Top")
-        self.always_on_top_checkbox.setChecked(self.settings.value("always_on_top", False, type=bool))
-        self.always_on_top_checkbox.stateChanged.connect(self.toggle_always_on_top)
-
-        # Save Button
-        save_button = QPushButton("Save Settings")
-        save_button.clicked.connect(self.save_settings)
-
-        layout.addWidget(api_keys_group)
-        layout.addWidget(model_selection_group)
-        layout.addWidget(commentator_group)
-        layout.addWidget(self.always_on_top_checkbox)
-        layout.addWidget(save_button)
-        layout.addStretch()
-
-    def toggle_always_on_top(self, state):
-        if state == Qt.Checked:
-            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
-        else:
-            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
-        self.show()
-
-    def update_commentator_list(self):
-        """Update the list of available commentators in the combo box."""
-        self.commentator_list.clear()
-        for metadata in self.commentator_manager.get_all_commentators():
-            display_text = f"{metadata.name} - {metadata.style}"
-            self.commentator_list.addItem(display_text, metadata.name)
-
-    def update_commentator_combos(self, combo_box, settings_key):
-        """Update a commentator combo box and set its saved selection."""
-        if not combo_box:
-            return
-
-        try:
-            combo_box.blockSignals(True)  # Prevent signal emissions during update
-            combo_box.clear()
-
-            last_selected = self.settings.value(settings_key, "Geoff")
-            selected_index = 0
-
-            # Get commentators and ensure we have at least one
-            commentators = self.commentator_manager.get_all_commentators()
-
-            # Debug output - helpful to check what's happening
-            print(f"Found {len(commentators)} commentators")
-            for c in commentators:
-                print(f"  - {c.name} ({c.style})")
-
-            if not commentators:
-                # This should not happen with our fixed get_all_commentators,
-                # but as a fallback, add a default
-                combo_box.addItem("Geoff - Default", "Geoff")
-            else:
-                # Add each commentator to the dropdown
-                for i, metadata in enumerate(commentators):
-                    display_text = f"{metadata.name} - {metadata.style}"
-                    combo_box.addItem(display_text, metadata.name)
-
-                    # Set the selected index if this matches the saved selection
-                    if metadata.name == last_selected:
-                        selected_index = i
-
-                # Make sure we have a valid index
-                if selected_index >= 0 and selected_index < combo_box.count():
-                    combo_box.setCurrentIndex(selected_index)
-        except Exception as e:
-            print(f"Error updating combo box: {str(e)}")
-            # Always ensure we have at least one item in the dropdown
-            if combo_box.count() == 0:
-                combo_box.addItem("Geoff - Default", "Geoff")
-        finally:
-            combo_box.blockSignals(False)  # Re-enable signals
-
-            # Reconnect the selection change handler
+        """Stops the currently running data collector."""
+        if self.data_collector and self.data_collector.isRunning():
             try:
-                combo_box.currentIndexChanged.disconnect()  # Remove any existing connections
-            except (TypeError, RuntimeError):
-                pass  # No connections existed or other disconnect error
-
-            # Connect the signal handler
-            combo_box.currentIndexChanged.connect(
-                lambda: self.settings.setValue(settings_key, combo_box.currentData())
-            )
-
-    def add_commentator(self):
-        """Open dialog to add a new commentator."""
-        dialog = CommentatorDialog(self)
-        if dialog.exec_():
-            data = dialog.get_data()
-            success = self.commentator_manager.create_commentator(
-                data['name'],
-                data['personality'],
-                data['style'],
-                data['examples'],
-                data['voice_id'],
-                data['main_prompt'],
-                data['second_pass_prompt']
-            )
-            if success:
-                self.update_commentator_list()
-                self.update_commentator_combos(self.main_commentator_combo, "main_commentator")
-                self.update_commentator_combos(self.second_commentator_combo, "second_commentator")
-                QMessageBox.information(self, "Success", "Commentator added successfully!")
-            else:
-                QMessageBox.warning(self, "Error", "Failed to add commentator. Name may already exist.")
-
-    def edit_commentator(self):
-        """Open dialog to edit the selected commentator."""
-        current_name = self.commentator_list.currentData()
-        if not current_name:
-            QMessageBox.warning(self, "Error", "Please select a commentator to edit.")
-            return
-
-        try:
-            # Get metadata first and verify it exists
-            metadata = self.commentator_manager.get_commentator_metadata(current_name)
-            if not metadata:
-                QMessageBox.warning(self, "Error", "Could not load commentator data.")
-                return
-
-            # Create dialog but don't show it yet
-            dialog = CommentatorDialog(self, metadata)
-
-            # Load prompts safely with error handling
-            try:
-                main_prompt = self.commentator_manager.get_prompt(current_name, second_pass=False)
-                second_pass_prompt = self.commentator_manager.get_prompt(current_name, second_pass=True)
-
-                if main_prompt:
-                    dialog.main_prompt_edit.setText(main_prompt)
-                if second_pass_prompt:
-                    dialog.second_pass_prompt_edit.setText(second_pass_prompt)
+                self.update_console("Stopping data collection...")
+                self.data_collector.stop()
+                # Don't wait here, cleanup in finished signal or closeEvent
+                self.update_console("Stop signal sent.")
             except Exception as e:
-                QMessageBox.warning(self, "Warning", f"Could not load all prompt data: {str(e)}")
+                self.update_console(f"Error stopping collector: {e}")
+        # Always update UI state, even if thread wasn't running (cleans up button)
+        self.setup_tab.update_button_state(collecting=False)
 
-            # Show dialog and get result
-            if dialog.exec_():
-                data = dialog.get_data()
 
-                # Verify data integrity before update
-                if not all(key in data for key in ['name', 'personality', 'style', 'examples', 'voice_id']):
-                    QMessageBox.warning(self, "Error", "Invalid commentator data format.")
-                    return
-
-                # Update with error handling
-                try:
-                    success = self.commentator_manager.update_commentator(
-                        current_name,
-                        data['name'],
-                        data['personality'],
-                        data['style'],
-                        data['examples'],
-                        data['voice_id'],
-                        data.get('main_prompt', ''),
-                        data.get('second_pass_prompt', '')
-                    )
-
-                    if success:
-                        # Update UI elements safely
-                        self.update_commentator_list()
-                        self.update_commentator_combos(self.main_commentator_combo, "main_commentator")
-                        self.update_commentator_combos(self.voice_commentator_combo, "voice_commentator")
-                        QMessageBox.information(self, "Success", "Commentator updated successfully!")
-                    else:
-                        QMessageBox.warning(self, "Error", "Failed to update commentator.")
-                except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to update commentator: {str(e)}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {str(e)}")
-        finally:
-            # Ensure dialog is properly closed
-            if 'dialog' in locals():
-                dialog.deleteLater()
-
-    def delete_commentator(self):
-        """Delete the selected commentator."""
-        current_name = self.commentator_list.currentData()
-        if not current_name:
-            QMessageBox.warning(self, "Error", "Please select a commentator to delete.")
+    def start_filtering(self, input_path: str, prompt_name: str):
+        """Starts the data filtering process."""
+        if self.data_filterer and self.data_filterer.isRunning():
+            QMessageBox.warning(self, "Busy", "Filtering process already running.")
             return
 
-        if current_name.lower() == "geoff":
-            QMessageBox.warning(self, "Error", "Cannot delete the default commentator.")
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Confirm Deletion",
-            f"Are you sure you want to delete the commentator '{current_name}'?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            success = self.commentator_manager.delete_commentator(current_name)
-            if success:
-                self.update_commentator_list()
-                self.update_commentator_combos(self.main_commentator_combo, "main_commentator")
-                self.update_commentator_combos(self.second_commentator_combo, "second_commentator")
-                QMessageBox.information(self, "Success", "Commentator deleted successfully!")
-            else:
-                QMessageBox.warning(self, "Error", "Failed to delete commentator.")
-
-    def browse_data_file(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select Race Data File", "", "Text Files (*.txt)")
-        if file_name:
-            self.data_path_input.setText(file_name)
-
-    def load_existing_file(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select Text File", "", "Text Files (*.txt)")
-        if file_name:
-            try:
-                with open(file_name, 'r', encoding='utf-8') as file:
-                    text_content = file.read()
-                self.csv_creator.load_data(text_content)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
-
-    def update_console(self, text):
-        self.console_output.append(text)
-
-    def filter_data(self):
-        input_path = self.data_path_input.text()
         settings = self.get_data_filterer_settings()
+        if not self._check_api_key(settings["api"], settings): return
 
-        if settings["api"] == "claude" and not settings["claude_key"]:
-            QMessageBox.warning(self, "API Key Missing", "Please enter your Claude API key in the Settings tab.")
-            return
-        elif settings["api"] == "openai" and not settings["openai_key"]:
-            QMessageBox.warning(self, "API Key Missing", "Please enter your OpenAI API key in the Settings tab.")
-            return
-
-        if not input_path:
-            QMessageBox.warning(self, "Input Missing", "Please select a race data file.")
-            return
+        prompt_content = self.data_filterer_prompt_manager.load_prompt(prompt_name)
+        if prompt_content is None:
+             QMessageBox.warning(self, "Prompt Error", f"Cannot load prompt: {prompt_name}.")
+             return
 
         try:
-            self.data_filterer = DataFilterer(input_path, settings)
+            self.data_filterer = DataFilterer(input_path, settings, prompt_content)
             self.data_filterer.progress_signal.connect(self.update_progress_bar)
-            self.data_filterer.output_signal.connect(self.update_console)
+            self.data_filterer.output_signal.connect(self.update_console) # Filterer logs go to main console
             self.data_filterer.finished.connect(self.on_filtering_finished)
             self.data_filterer.start()
+            self.update_console(f"Filtering '{os.path.basename(input_path)}' using prompt: '{prompt_name}'...")
+            # Let the tab manage its button state
+            self.highlight_reel_tab.filter_button.setEnabled(False)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start data filtering: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed starting filtering: {str(e)}")
+            self.update_console(f"Error starting filter thread: {e}\n{traceback.format_exc()}")
+            self.highlight_reel_tab.filter_button.setEnabled(True) # Ensure enabled on error
 
-    def on_filtering_finished(self):
-        filtered_file_path = self.data_filterer.get_output_path()
-        try:
-            with open(filtered_file_path, 'r', encoding='utf-8') as file:
-                text_content = file.read()
-            self.csv_creator.load_data(text_content)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load filtered data: {str(e)}")
+    def start_commentary_generation(self, input_path: str, commentator_name: str):
+        """Starts the commentary generation process."""
+        if self.race_commentator and self.race_commentator.isRunning():
+             QMessageBox.warning(self, "Busy", "Commentary generation already running.")
+             return
 
-    def browse_commentary_input(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select Input File", "", "Text Files (*.txt)")
-        if file_name:
-            self.commentary_input.setText(file_name)
-
-    def browse_voice_input(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select Input File", "", "Text Files (*.txt)")
-        if file_name:
-            self.voice_input.setText(file_name)
-
-    def generate_commentary(self):
-        input_path = self.commentary_input.text()
-        if not input_path:
-            input_path = self.data_filterer.get_output_path() if hasattr(self, 'data_filterer') else None
-
-        if not input_path:
-            QMessageBox.warning(self, "Input Missing", "Please select an input file.")
-            return
-
-        # Get selected commentator data
-        main_commentator = self.main_commentator_combo.currentData()
-        if not main_commentator:
-            QMessageBox.warning(self, "Error", "Please select a commentator.")
-            return
-
-        main_metadata = self.commentator_manager.get_commentator_metadata(main_commentator)
-        if not main_metadata:
-            QMessageBox.warning(self, "Error", "Could not load commentator data.")
-            return
-
-        # Get the main prompt
-        main_prompt = self.commentator_manager.get_prompt(main_commentator, second_pass=False)
+        main_meta = self.commentator_manager.get_commentator_metadata(commentator_name)
+        if not main_meta:
+             QMessageBox.warning(self, "Metadata Error", f"Cannot load metadata for '{commentator_name}'.")
+             return
+        main_prompt = self.commentator_manager.get_prompt(commentator_name, second_pass=False)
+        if main_prompt is None:
+             QMessageBox.warning(self, "Prompt Error", f"Cannot load main prompt for '{commentator_name}'.")
+             return
 
         settings = self.get_race_commentator_settings()
+        if not self._check_api_key(settings["api"], settings): return
+
         settings.update({
-            'main_prompt': main_prompt,
-            'main_voice_id': main_metadata.voice_id
+            'main_prompt': main_prompt, 'main_voice_id': main_meta.voice_id,
+            'commentator_name': main_meta.name, 'commentator_style': main_meta.style,
+            'commentator_personality': main_meta.personality, 'commentator_examples': main_meta.examples,
         })
 
         try:
             self.race_commentator = RaceCommentator(input_path, settings)
-            self.race_commentator.output_signal.connect(self.update_commentary_output)
+            self.race_commentator.output_signal.connect(self.commentary_tab.update_output) # Send output direct to tab
             self.race_commentator.progress_signal.connect(self.update_progress_bar)
+            self.race_commentator.finished.connect(self.on_commentary_finished)
             self.race_commentator.start()
+            self.update_console(f"Generating commentary for '{os.path.basename(input_path)}' using '{commentator_name}'...")
+            self.commentary_tab.generate_button.setEnabled(False)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start commentary generation: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed starting commentary: {str(e)}")
+            self.update_console(f"Error starting commentary thread: {e}\n{traceback.format_exc()}")
+            self.commentary_tab.generate_button.setEnabled(True)
 
-    def generate_voice(self):
-        input_path = self.voice_input.text()
-        if not input_path:
-            input_path = self.race_commentator.get_output_path() if hasattr(self, 'race_commentator') else None
 
-        if not input_path:
-            QMessageBox.warning(self, "Input Missing", "Please select an input file.")
-            return
+    def start_voice_generation(self, input_path: str, commentator_name: str):
+        """Starts the voice generation process."""
+        if self.voice_generator and self.voice_generator.isRunning():
+             QMessageBox.warning(self, "Busy", "Voice generation already running.")
+             return
 
-        eleven_labs_api_key = self.get_eleven_labs_api_key()
-        if not eleven_labs_api_key:
-            QMessageBox.warning(self, "API Key Missing", "Please enter your ElevenLabs API key in the Settings tab.")
-            return
+        cartesia_key = self.get_cartesia_api_key()
+        if not cartesia_key:
+             QMessageBox.warning(self, "API Key Missing", "Enter Cartesia API key in Settings.")
+             return
 
-        # Get the selected commentator's voice ID
-        selected_commentator = self.voice_commentator_combo.currentData()
-        if not selected_commentator:
-            QMessageBox.warning(self, "Error", "Please select a commentator.")
-            return
-
-        metadata = self.commentator_manager.get_commentator_metadata(selected_commentator)
+        metadata = self.commentator_manager.get_commentator_metadata(commentator_name)
         if not metadata:
-            QMessageBox.warning(self, "Error", "Could not load commentator data.")
+             QMessageBox.warning(self, "Metadata Error", f"Cannot load metadata for '{commentator_name}'.")
+             return
+        if not metadata.voice_id:
+             QMessageBox.warning(self, "Voice ID Missing", f"'{commentator_name}' has no Cartesia Voice ID.")
+             return
+
+        cartesia_model = self.settings.value("cartesia_model", "sonic-english")
+        commentary_api_settings = self.get_race_commentator_settings() # For second pass
+        commentary_api_settings['claude_key'] = self.get_claude_api_key()
+        commentary_api_settings['openai_key'] = self.get_openai_api_key()
+        commentary_api_settings['google_key'] = self.get_google_api_key()
+        second_pass_prompt = self.commentator_manager.get_prompt(commentator_name, second_pass=True)
+        if second_pass_prompt: commentary_api_settings['second_pass_prompt'] = second_pass_prompt
+        # Check API key for second pass ONLY if second pass prompt exists
+        if second_pass_prompt and not self._check_api_key(commentary_api_settings['api'], commentary_api_settings):
+            QMessageBox.warning(self, "API Key Missing", f"Second pass requires {commentary_api_settings['api'].capitalize()} key (set in Settings).")
             return
 
-        self.voice_generator = VoiceGenerator(input_path, eleven_labs_api_key, metadata.voice_id)
-        self.voice_generator.output_signal.connect(self.update_voice_output)
-        self.voice_generator.progress_signal.connect(self.update_progress_bar)
-        self.voice_generator.start()
+        try:
+            self.voice_generator = VoiceGenerator(
+                input_path=input_path, api_key=cartesia_key, voice_id=metadata.voice_id,
+                speed=metadata.voice_speed, emotion=metadata.voice_emotions,
+                model_id=cartesia_model, commentary_api_settings=commentary_api_settings
+            )
+            self.voice_generator.output_signal.connect(self.voice_tab.update_output) # Output direct to tab
+            self.voice_generator.progress_signal.connect(self.update_progress_bar)
+            self.voice_generator.finished.connect(self.on_voice_finished)
+            self.voice_generator.start()
+            self.update_console(f"Generating voice using '{commentator_name}' (ID: {metadata.voice_id}, Model: {cartesia_model})...");
+            self.voice_tab.generate_button.setEnabled(False)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed starting voice gen: {str(e)}")
+            self.update_console(f"Error starting voice gen thread: {e}\n{traceback.format_exc()}")
+            self.voice_tab.generate_button.setEnabled(True)
 
-    def update_commentary_output(self, text):
-        self.commentary_output.append(text)
+    def start_auto_director(self, game: str, script_path: str, audio_path: str, map_path: str, pre_roll: int) -> bool:
+        """Starts the Auto Director thread."""
+        if self.ams2_director and self.ams2_director.isRunning():
+            QMessageBox.warning(self, "Already Running", "Auto Director already running.")
+            return False
 
-    def update_voice_output(self, text):
-        self.voice_output.append(text)
+        if game == "Automobilista 2":
+            if not pygame or not pygame.get_init() or not pygame.mixer.get_init():
+                 QMessageBox.critical(self, "Pygame Error", "Pygame Mixer not initialized. Cannot start AMS2 Director.")
+                 return False
+            try:
+                self.ams2_director = AMS2Director(script_path, audio_path, map_path, pre_roll)
+                self.ams2_director.output_signal.connect(self.auto_director_tab.update_status)
+                self.ams2_director.countdown_signal.connect(self.auto_director_tab.update_status)
+                self.ams2_director.finished_signal.connect(self.on_director_finished)
+                self.ams2_director.start()
+                self.update_console(f"AMS2 Director thread started.")
+                return True # Success
+            except Exception as e:
+                QMessageBox.critical(self, "Initialization Error", f"Failed to initialize AMS2Director: {e}")
+                self.update_console(f"Error initializing director: {e}\n{traceback.format_exc()}")
+                return False # Failure
+        else:
+            QMessageBox.information(self, "Not Implemented", f"Director for {game} not implemented.")
+            return False
+
+    def stop_auto_director(self):
+        """Signals the Auto Director thread to stop."""
+        if self.ams2_director and self.ams2_director.isRunning():
+            self.update_console("Sending stop signal to Auto Director...")
+            self.ams2_director.stop()
+            # Button state managed by tab now based on finished signal
+        else:
+            self.update_console("Director not running.")
+            # Ensure button state is correct if out of sync
+            self.auto_director_tab.set_controls_state(running=False)
+
+
+    # --- Thread Finished Slots ---
+
+    def on_data_collector_finished(self):
+        self.update_console("Data collection thread finished.")
+        # Button state should be updated already by stop_data_collection or error handling
+        self.data_collector = None # Clean up instance
+        self.progress_bar.setValue(0) # Reset progress
+
+    def on_filtering_finished(self):
+        self.update_console("Filtering thread finished.")
+        output_path = None
+        success = False
+        if self.data_filterer:
+            output_path = self.data_filterer.get_output_path()
+            # TODO: Add a success status check to DataFilterer if possible
+            success = bool(output_path and os.path.exists(output_path))
+            if not success:
+                 # Try to get error message if filterer provides one
+                 error_msg = getattr(self.data_filterer, 'error_message', 'Unknown filtering error.')
+                 self.update_console(f"Filtering failed: {error_msg}")
+            else:
+                self.last_filter_output_path = output_path # Store on success
+
+        # Notify the Highlight tab
+        self.highlight_reel_tab.on_filtering_finished(success, output_path)
+        # Update commentary input if successful
+        if success and output_path:
+             self.commentary_tab.set_input_path(output_path)
+        self.data_filterer = None # Clean up instance
+        self.progress_bar.setValue(0) # Reset progress
+        self.highlight_reel_tab.filter_button.setEnabled(True) # Re-enable button
+
+    def on_commentary_finished(self):
+        self.update_console("Commentary generation thread finished.")
+        output_path = None
+        success = False
+        if self.race_commentator:
+             output_path = self.race_commentator.get_output_path()
+             # TODO: Check success status from RaceCommentator
+             success = bool(output_path and os.path.exists(output_path))
+             if not success:
+                  error_msg = getattr(self.race_commentator, 'error_message', 'Unknown commentary error.')
+                  self.update_console(f"Commentary generation failed: {error_msg}")
+             else:
+                self.last_commentary_output_path = output_path # Store on success
+
+        # Notify the Commentary tab
+        self.commentary_tab.on_commentary_finished(success, output_path)
+        # Update voice input if successful
+        if success and output_path:
+            self.voice_tab.set_input_path(output_path)
+            # Maybe auto-populate director script path too?
+            self.auto_director_tab.update_inputs(script_path=output_path)
+        self.race_commentator = None # Clean up instance
+        self.progress_bar.setValue(0) # Reset progress
+        self.commentary_tab.generate_button.setEnabled(True) # Re-enable button
+
+    def on_voice_finished(self):
+        self.update_console("Voice generation thread finished.")
+        output_dir = None
+        success = False
+        if self.voice_generator:
+             output_dir = self.voice_generator.get_output_dir()
+             # TODO: Check success status from VoiceGenerator
+             success = bool(output_dir and os.path.isdir(output_dir))
+             if not success:
+                  error_msg = getattr(self.voice_generator, 'error_message', 'Unknown voice generation error.')
+                  self.update_console(f"Voice generation failed: {error_msg}")
+             else:
+                self.last_voice_output_dir = output_dir # Store on success
+
+        # Notify the Voice tab
+        self.voice_tab.on_voice_finished(success, output_dir)
+        # TODO: Auto-populate director audio path if combined audio is created?
+        # combined_audio = find_combined_audio(output_dir) # Needs implementation
+        # if combined_audio: self.auto_director_tab.update_inputs(audio_path=combined_audio)
+        self.voice_generator = None # Clean up instance
+        self.progress_bar.setValue(0) # Reset progress
+        self.voice_tab.generate_button.setEnabled(True) # Re-enable button
+
+    def on_director_finished(self):
+        """Called when the Auto Director thread finishes or is stopped."""
+        self.update_console("Director thread finished.")
+        stopped_by_user = False
+        if self.ams2_director and hasattr(self.ams2_director, '_stop_requested'):
+             stopped_by_user = self.ams2_director._stop_requested
+
+        if stopped_by_user:
+            self.auto_director_tab.update_status("Director stopped by user.")
+        else:
+            self.auto_director_tab.update_status("Director finished sequence.")
+
+        # Clean up thread instance and reset button via tab method
+        self.ams2_director = None
+        self.auto_director_tab.set_controls_state(running=False)
+        self.progress_bar.setValue(0) # Reset progress
+
+
+    # --- Signal Handlers for UI Updates ---
+
+    def update_console(self, text):
+        """Appends text to the currently active console/log display."""
+        if self.current_console_widget:
+            try:
+                if not isinstance(text, str): text = str(text)
+                self.current_console_widget.append(text)
+                scrollbar = self.current_console_widget.verticalScrollBar()
+                if scrollbar: scrollbar.setValue(scrollbar.maximum())
+            except Exception as e:
+                 print(f"Error updating console UI: {e}")
+        else:
+            print(f"Console log (UI target missing): {text}") # Fallback
+
+    def update_video_log_display(self, text):
+        """Appends event to the dedicated video log display in SetupTab."""
+        if hasattr(self.setup_tab, 'video_log_display') and self.setup_tab.video_log_display:
+            log_widget = self.setup_tab.video_log_display
+            log_widget.append(text)
+            scrollbar = log_widget.verticalScrollBar()
+            if scrollbar: scrollbar.setValue(scrollbar.maximum())
+        else:
+            print(f"Video Log (UI not ready/missing): {text}")
 
     def update_progress_bar(self, value):
+        """Updates the progress bar in the status bar."""
         self.progress_bar.setValue(value)
 
-    def save_settings(self):
-        self.settings.setValue("claude_api_key", self.claude_api_key_input.text())
-        self.settings.setValue("openai_api_key", self.openai_api_key_input.text())
-        self.settings.setValue("eleven_labs_api_key", self.eleven_labs_api_key_input.text())
-
-        self.settings.setValue("data_filterer_api",
-                               "claude" if self.data_filterer_claude_radio.isChecked() else "openai")
-        self.settings.setValue("data_filterer_model", self.data_filterer_model_input.text())
-
-        self.settings.setValue("race_commentator_api",
-                               "claude" if self.race_commentator_claude_radio.isChecked() else "openai")
-        self.settings.setValue("race_commentator_model", self.race_commentator_model_input.text())
-
-        # Save the Always on Top setting
-        self.settings.setValue("always_on_top", self.always_on_top_checkbox.isChecked())
-
-        QMessageBox.information(self, "Settings Saved", "Your settings have been saved successfully!")
-
-    def get_claude_api_key(self):
-        return self.settings.value("claude_api_key", "")
-
-    def get_openai_api_key(self):
-        return self.settings.value("openai_api_key", "")
-
-    def get_eleven_labs_api_key(self):
-        return self.settings.value("eleven_labs_api_key", "")
+    # --- Settings Getters ---
+    def get_claude_api_key(self): return self.settings.value("claude_api_key", "")
+    def get_openai_api_key(self): return self.settings.value("openai_api_key", "")
+    def get_google_api_key(self): return self.settings.value("google_api_key", "")
+    def get_cartesia_api_key(self): return self.settings.value("cartesia_api_key", "")
 
     def get_data_filterer_settings(self):
+        # Read directly from settings saved by SettingsTab
         return {
-            "api": "claude" if self.data_filterer_claude_radio.isChecked() else "openai",
-            "model": self.data_filterer_model_input.text(),
+            "api": self.settings.value("data_filterer_api", "gemini"),
+            "model": self.settings.value("data_filterer_model", "gemini-1.5-flash-latest"),
             "claude_key": self.get_claude_api_key(),
-            "openai_key": self.get_openai_api_key()
+            "openai_key": self.get_openai_api_key(),
+            "google_key": self.get_google_api_key()
         }
 
     def get_race_commentator_settings(self):
+        # Read directly from settings saved by SettingsTab
         return {
-            "api": "claude" if self.race_commentator_claude_radio.isChecked() else "openai",
-            "model": self.race_commentator_model_input.text(),
+            "api": self.settings.value("race_commentator_api", "gemini"),
+            "model": self.settings.value("race_commentator_model", "gemini-1.5-flash-latest"),
             "claude_key": self.get_claude_api_key(),
-            "openai_key": self.get_openai_api_key()
+            "openai_key": self.get_openai_api_key(),
+            "google_key": self.get_google_api_key()
         }
 
+    def _check_api_key(self, api_name, settings_dict):
+        """Checks if the required API key exists in the settings dict."""
+        # --- FIX: Handle Gemini's specific key name ---
+        if api_name == "gemini":
+            key_name = "google_key"
+        else:
+            # For Claude and OpenAI, the key name matches the api_name
+            key_name = f"{api_name}_key"
+        # ---------------------------------------------
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+        # Now check using the correctly determined key_name
+        if key_name in settings_dict and settings_dict[key_name]:
+            # Key found and is not empty
+            return True
+        else:
+            # Key not found or is empty
+            # --- FIX: Improve error message for Gemini ---
+            # Make the error message more specific for the user
+            display_name = "Google (for Gemini)" if api_name == "gemini" else api_name.capitalize()
+            QMessageBox.warning(self, "API Key Missing",
+                                f"Please enter your {display_name} API key in the Settings tab.")
+            # ---------------------------------------------
+            return False
+
+
+    # --- Application Closing ---
+    def closeEvent(self, event):
+        """Ensure threads and pygame are stopped cleanly on exit."""
+        print("Close event triggered.")
+        if hasattr(self,'setup_tab') and self.setup_tab and self.setup_tab.is_video_logging_active:
+             self.setup_tab.stop_video_log_session(ask_save=True, closing_app=True)
+
+        self.stop_data_collection() # Signal collector to stop
+        self.stop_auto_director() # Signal director to stop
+
+        threads_to_stop = [
+            ("Data Collector", self.data_collector),
+            ("Data Filterer", self.data_filterer),
+            ("Race Commentator", self.race_commentator),
+            ("Voice Generator", self.voice_generator),
+            ("Auto Director", self.ams2_director),
+        ]
+
+        for name, thread in threads_to_stop:
+             if thread and thread.isRunning():
+                 print(f"Waiting for {name} to finish...")
+                 if hasattr(thread, 'stop'): # Signal stop if available
+                     try: thread.stop()
+                     except: pass # Ignore errors if stop method changed/missing
+                 thread.wait(2000) # Wait up to 2 seconds
+                 if thread.isRunning(): print(f"Warning: {name} did not stop gracefully.")
+                 else: print(f"{name} stopped.")
+
+        if pygame and pygame.get_init():
+            try:
+                if pygame.mixer.get_init():
+                     pygame.mixer.music.stop()
+                     pygame.mixer.quit()
+                pygame.quit()
+                print("Pygame quit.")
+            except Exception as e:
+                print(f"Error quitting pygame: {e}")
+
+        print("Exiting application.")
+        event.accept()
+
+
+# --- Main execution block ---
+# This part is usually in main.py, but included here for completeness
+# if __name__ == "__main__":
+#     app = QApplication(sys.argv)
+#
+#     # Check Multimedia Availability
+#     test_player = QMediaPlayer()
+#     if test_player.availability() == QMediaPlayer.AvailabilityUnavailable:
+#          QMessageBox.critical(None, "Multimedia Error",
+#                               "Qt Multimedia unavailable. Video playback may fail.\n"
+#                               "Install necessary plugins (GStreamer/Media Feature Pack/etc).")
+#     del test_player
+#
+#     window = MainWindow()
+#     window.show()
+#     sys.exit(app.exec_())
